@@ -6,12 +6,11 @@ struct SYNYPanel: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        // 面板使用固定尺寸（400×500），由 NSPopover 的 contentSize 承接：
-        // 尺寸恒定 → popover 始终锚定不漂移；内容超出时整体滚动。
-        ScrollView {
+        // 高度自适应：面板高度 = 内容自然高度（并夹在 [下限, 用户上限] 之间），
+        // 折叠/展开高级设置时高度自动跟随，底部不留多余空白；超过上限时内部滚动。
+        ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: Metrics.sectionGap) {
                 HeaderView()
-                StatusPill(text: model.message, kind: model.messageKind)
                 AccountCard()
                 PrimaryButton()
                 AdvancedSection()
@@ -20,17 +19,35 @@ struct SYNYPanel: View {
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(key: PanelHeightKey.self,
+                                           value: proxy.size.height)
+                }
+            )
         }
-        .frame(width: 400, height: 500)
+        .frame(width: AppModel.panelWidth)
+        .frame(height: model.panelPreferredHeight)
         .background(Palette.windowBG)
+        .onPreferenceChange(PanelHeightKey.self) { model.panelContentHeight = $0 }
         .onAppear { model.bootstrap() }
     }
 }
 
-// MARK: - 头部
+/// 收集面板内容的自然高度，用于让弹层高度自适应内容。
+private struct PanelHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+// MARK: - 头部（标题 + 右上角状态提示）
 private struct HeaderView: View {
+    @EnvironmentObject var model: AppModel
+
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(alignment: .center, spacing: 12) {
             RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .fill(Palette.accent)
                 .frame(width: 44, height: 44)
@@ -47,8 +64,11 @@ private struct HeaderView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
+            .fixedSize(horizontal: true, vertical: false)   // 标题优先，不被就地压缩
 
-            Spacer(minLength: 8)
+            // 状态提示上移到标题右侧空白处；占满剩余宽度并右对齐，长文案自动换行
+            StatusPill(text: model.message, kind: model.messageKind)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 }
@@ -58,20 +78,21 @@ private struct StatusPill: View {
     let kind: AppModel.MessageKind
 
     var body: some View {
-        HStack(spacing: 7) {
-            Circle().fill(color).frame(width: 8, height: 8)
+        // 紧凑形态：置于标题右侧；长文案最多 2 行，完整显示不截断。
+        HStack(alignment: .top, spacing: 6) {
+            Circle().fill(color).frame(width: 8, height: 8).padding(.top, 3)
             Text(text)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(color)
                 .lineLimit(2)
+                .multilineTextAlignment(.leading)
                 .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
         .background(Palette.card, in: Capsule())
         .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
+        .help(text)
     }
 
     private var color: Color {
@@ -152,6 +173,7 @@ private struct AdvancedSection: View {
             VStack(alignment: .leading, spacing: Metrics.sectionGap) {
                 ServiceCard()
                 ActionsCard()
+                AppearanceCard()
                 LogCard()
             }
             .padding(.top, 10)
@@ -237,6 +259,32 @@ private struct ActionsCard: View {
             .buttonStyle(.bordered)
         }
         .disabled(model.busy)
+        .card()
+    }
+}
+
+// MARK: - 界面（面板高度自定义）
+private struct AppearanceCard: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel("界面")
+
+            LabeledRow("面板高度上限") {
+                Stepper(value: Binding(
+                    get: { Double(model.panelMaxHeight) },
+                    set: { model.setPanelMaxHeight(CGFloat($0)) }
+                ), in: 320...900, step: 20) {
+                    Text("\(Int(model.panelMaxHeight)) pt")
+                        .monospacedDigit()
+                }
+            }
+
+            Text("面板高度会随高级设置的展开/收起自动调整；超过上限后内部滚动。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
         .card()
     }
 }

@@ -33,6 +33,32 @@ final class AppModel: ObservableObject {
     @Published var advancedOpen = false
     @Published var showPassword = false
 
+    // MARK: 面板尺寸（界面偏好，存 UserDefaults）
+    // 目标：底部不留多余空白——面板高度 = 内容自然高度，且不超过用户设定的上限；
+    // 内容超过上限时面板内部滚动。
+    static let panelWidth: CGFloat = 400
+    static let panelMinHeight: CGFloat = 220
+    static let panelDefaultMaxHeight: CGFloat = 560
+
+    /// 内容自然高度（由面板视图用 GeometryReader 回填）。
+    @Published var panelContentHeight: CGFloat = 0
+    /// 用户自定义的面板高度上限（持久化）。
+    @Published var panelMaxHeight: CGFloat = {
+        let saved = UserDefaults.standard.object(forKey: "syny.panelMaxHeight") as? Double
+        return CGFloat(saved ?? Double(AppModel.panelDefaultMaxHeight))
+    }()
+
+    /// popover 实际采用的尺寸高度：内容自然高度，并夹在 [min, max] 之间。
+    var panelPreferredHeight: CGFloat {
+        guard panelContentHeight > 0 else { return panelMaxHeight }
+        return min(max(panelContentHeight, Self.panelMinHeight), panelMaxHeight)
+    }
+
+    func setPanelMaxHeight(_ height: CGFloat) {
+        panelMaxHeight = min(max(height, 320), 900)
+        UserDefaults.standard.set(Double(panelMaxHeight), forKey: "syny.panelMaxHeight")
+    }
+
     private var didLoadForm = false
     private var started = false
     private var timer: Timer?

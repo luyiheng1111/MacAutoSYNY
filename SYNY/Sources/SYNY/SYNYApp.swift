@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 @main
 struct SYNYApp: App {
@@ -21,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
     private let model = AppModel()
+    private var cancellables = Set<AnyCancellable>()
 
     /// 诊断开关（默认关闭）：设环境变量 `SYNY_POPOVER_SELFTEST=1`，或创建标记文件
     /// `/tmp/syny_selftest` 才启用。启用后会写 `/tmp/syny_popover.log`，并在启动后
@@ -45,7 +47,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover.behavior = .transient
         popover.animates = false
-        popover.contentSize = NSSize(width: 400, height: 500)
         let hosting = NSHostingController(rootView: SYNYPanel().environmentObject(model))
         // NSHostingController 显式声明尺寸策略，让宿主视图有确定尺寸；否则其尺寸
         // 可能未定，影响 popover 内容布局。
@@ -53,6 +54,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hosting.sizingOptions = [.preferredContentSize]
         }
         popover.contentViewController = hosting
+
+        // 面板高度自适应内容（并受用户设定上限约束）：订阅模型尺寸变化，实时同步 popover。
+        model.$panelContentHeight
+            .combineLatest(model.$panelMaxHeight)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _, _ in self?.applyPanelSize() }
+            .store(in: &cancellables)
+        applyPanelSize()
 
         closeStrayWindows()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -89,6 +98,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.orderOut(nil)
             window.close()
         }
+    }
+
+    /// 同步 popover 尺寸为「内容自适应、且不超过用户上限」的高度。
+    private func applyPanelSize() {
+        let size = NSSize(width: AppModel.panelWidth, height: model.panelPreferredHeight)
+        popover.contentSize = size
+        popover.contentViewController?.preferredContentSize = size
     }
 
     @objc private func togglePopover(_ sender: Any?) {
