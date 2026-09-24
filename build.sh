@@ -1,6 +1,8 @@
 #!/bin/sh
-# 【已弃用】Tkinter 旧版构建脚本。原生版请用 scripts/build-app.sh（SwiftUI 前端）。
-# 保留仅供回退对比：产物改名为 SYNY-Tkinter.app，避免覆盖原生版 SYNY.app。
+# 【已弃用】Tkinter 旧版构建脚本。
+#   - 推荐（纯 Swift、无 Python 依赖）：./scripts/build-swift.sh
+#   - 过渡（SwiftUI 前端 + Python 后端）：./scripts/build-app.sh
+# 本脚本保留仅供回退对比：产物改名为 SYNY-Tkinter.app，避免覆盖原生版 SYNY.app。
 #
 #   ./build.sh              仅构建到当前目录（SYNY-Tkinter.app）
 #   ./build.sh --install    构建并安装到 /Applications

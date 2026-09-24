@@ -233,6 +233,49 @@ private struct ServiceCard: View {
                 .toggleStyle(.switch)
             Toggle("仅 syny WiFi 下认证", isOn: $model.onlySynyWifi)
                 .toggleStyle(.switch)
+            
+            // WiFi 状态显示
+            if model.wifiHasInterface {
+                HStack {
+                    Text("当前网络")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        if model.wifiNameIsRedacted {
+                            Text("已连接但名称被系统脱敏")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        } else if !model.wifiSSID.isEmpty {
+                            Text(model.wifiSSID)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(model.wifiIsSyny ? .green : .secondary)
+                        } else if model.wifiHasAddress {
+                            Text("已连接（获取到 IP 地址）")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("已连接 Wi-Fi 接口但未获取 IP")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+                .background(Palette.card.opacity(0.3), in: RoundedRectangle(cornerRadius: 6))
+            } else {
+                HStack {
+                    Text("当前网络")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("未检测到 Wi-Fi 接口")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+                .background(Palette.card.opacity(0.3), in: RoundedRectangle(cornerRadius: 6))
+            }
         }
         .card()
     }

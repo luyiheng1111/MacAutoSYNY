@@ -2,6 +2,9 @@ import Foundation
 import SwiftUI
 
 /// 应用状态与动作：所有后端调用都丢到后台队列，回到主线程更新 UI。
+///
+/// 后端已是进程内的原生 Swift（`BackendBridge`），不再起 Python 子进程；
+/// 但调用仍是阻塞式的（网络 / launchd / 钥匙串），因此保留后台队列的调度方式。
 @MainActor
 final class AppModel: ObservableObject {
 
@@ -11,7 +14,7 @@ final class AppModel: ObservableObject {
     @Published var username = ""
     @Published var password = ""
     @Published var checkInterval = "30"
-    @Published var captiveURL = "http://www.google.cn/generate_204"
+    @Published var captiveURL = "http://connect.rom.miui.com/generate_204"
     @Published var portalHint = ""
     @Published var autoStart = true
     @Published var notify = true
@@ -24,6 +27,9 @@ final class AppModel: ObservableObject {
     @Published var serviceRunning = false
     @Published var wifiSSID = ""
     @Published var wifiIsSyny = false
+    @Published var wifiHasInterface = false
+    @Published var wifiHasAddress = false
+    @Published var wifiNameIsRedacted = false
     @Published var logContent = "(暂无日志内容)"
 
     // MARK: 界面
@@ -63,7 +69,7 @@ final class AppModel: ObservableObject {
     private var started = false
     private var timer: Timer?
     private var lastOpAt = Date.distantPast
-    private let work = DispatchQueue(label: "com.syny.bridge", qos: .userInitiated)
+    private let work = DispatchQueue(label: "com.syny.backend", qos: .userInitiated)
 
     // MARK: - 生命周期
     func bootstrap() {
@@ -81,14 +87,14 @@ final class AppModel: ObservableObject {
     func refresh() {
         guard !busy else { return }
         work.async { [weak self] in
-            let response = PythonBridge.call(["op": "status"])
-            let payload = PythonBridge.decode(StatusPayload.self, response: response)
+            let response = BackendBridge.call(["op": "status"])
+            let payload = BackendBridge.decode(StatusPayload.self, response: response)
             DispatchQueue.main.async {
                 guard let self else { return }
                 if let payload {
                     self.apply(payload)
                 } else {
-                    self.setMessage(PythonBridge.message(response), kind: .error)
+                    self.setMessage(BackendBridge.message(response), kind: .error)
                 }
             }
         }
@@ -140,7 +146,7 @@ final class AppModel: ObservableObject {
         let name = username
         guard !name.isEmpty else { return }
         work.async { [weak self] in
-            let response = PythonBridge.call(["op": "get_password", "username": name])
+            let response = BackendBridge.call(["op": "get_password", "username": name])
             let value = (response["data"] as? [String: Any])?["password"] as? String ?? ""
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -156,21 +162,21 @@ final class AppModel: ObservableObject {
         busy = true
         setMessage("正在保存并启用…", kind: .neutral)
         work.async { [weak self] in
-            let saveResponse = PythonBridge.call(save)
-            guard PythonBridge.isOK(saveResponse) else {
+            let saveResponse = BackendBridge.call(save)
+            guard BackendBridge.isOK(saveResponse) else {
                 DispatchQueue.main.async {
                     self?.busy = false
-                    self?.setMessage(PythonBridge.message(saveResponse), kind: .error)
+                    self?.setMessage(BackendBridge.message(saveResponse), kind: .error)
                 }
                 return
             }
-            let startResponse = PythonBridge.call(["op": "start"])
+            let startResponse = BackendBridge.call(["op": "start"])
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.busy = false
                 self.lastOpAt = Date()
-                let ok = PythonBridge.isOK(startResponse)
-                self.setMessage(PythonBridge.message(startResponse), kind: ok ? .ok : .error)
+                let ok = BackendBridge.isOK(startResponse)
+                self.setMessage(BackendBridge.message(startResponse), kind: ok ? .ok : .error)
                 self.refresh()
             }
         }
@@ -215,7 +221,7 @@ final class AppModel: ObservableObject {
     func refreshLog() {
         if busy { return }
         work.async { [weak self] in
-            let response = PythonBridge.call(["op": "log"])
+            let response = BackendBridge.call(["op": "log"])
             let content = (response["data"] as? [String: Any])?["content"] as? String ?? ""
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -231,12 +237,12 @@ final class AppModel: ObservableObject {
         busy = true
         setMessage(busyText, kind: .neutral)
         work.async { [weak self] in
-            let response = PythonBridge.call(request)
+            let response = BackendBridge.call(request)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.busy = false
-                let ok = PythonBridge.isOK(response)
-                let text = PythonBridge.message(response)
+                let ok = BackendBridge.isOK(response)
+                let text = BackendBridge.message(response)
                 self.setMessage(text.isEmpty ? (ok ? "完成" : "操作失败") : text,
                                 kind: ok ? .ok : .error)
                 if ok {

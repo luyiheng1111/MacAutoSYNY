@@ -27,7 +27,7 @@ struct SYNYConfig: Codable, Equatable {
     static let fallback = SYNYConfig(
         username: "",
         checkInterval: 30,
-        captiveURL: "http://www.google.cn/generate_204",
+        captiveURL: "http://connect.rom.miui.com/generate_204",
         portalHint: "",
         autoStart: true,
         notify: true,
@@ -46,10 +46,16 @@ struct ServiceStatus: Codable {
 struct WifiStatus: Codable {
     var ssid: String
     var isSyny: Bool
-
+    var hasWifiInterface: Bool
+    var wifiHasAddress: Bool
+    var nameIsRedacted: Bool
+    
     enum CodingKeys: String, CodingKey {
         case ssid
         case isSyny = "is_syny"
+        case hasWifiInterface = "has_wifi_interface"
+        case wifiHasAddress = "wifi_has_address"
+        case nameIsRedacted = "name_is_redacted"
     }
 }
 
