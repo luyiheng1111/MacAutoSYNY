@@ -11,7 +11,12 @@
 # 产物结构：
 #   SYNY.app/Contents/MacOS/SYNY            SwiftUI 可执行文件
 #   SYNY.app/Contents/Resources/syny_auth   Python 后端包（前端以子进程调用）
+#   SYNY.app/Contents/Resources/python      内置 Python 运行时（自包含分发，接收方无需装 Python）
 #   SYNY.app/Contents/Resources/icon.icns   应用图标
+#
+# 可用环境变量：
+#   SYNY_BUNDLE_PYTHON  指定要打包的 Python 根目录（含 bin/python3）；默认自动查找
+#   PYTHON              构建期用的 python（生成图标）
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -48,6 +53,36 @@ cp "$BIN" "$APP/Contents/MacOS/SYNY"
 cp -R "$ROOT/src/syny_auth" "$APP/Contents/Resources/syny_auth"
 find "$APP/Contents/Resources" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
+# 内置 Python 运行时 —— 自包含分发：接收方无需再安装 Python。
+# 需要「可重定位」的 python-build-standalone（install_only）布局；用 rsync 按排除法
+# 复制（不删除，避免触发批量删除保护），裁掉后端用不到的 GUI/安装器/头文件/Tcl-Tk。
+PY_SRC="${SYNY_BUNDLE_PYTHON:-}"
+if [ -z "$PY_SRC" ]; then
+    for cand in "$HOME"/.workbuddy/binaries/python/versions/*/; do
+        [ -x "${cand}bin/python3" ] && PY_SRC="$cand"
+    done
+fi
+PY_DST="$APP/Contents/Resources/python"
+if [ -n "$PY_SRC" ] && [ -x "${PY_SRC}bin/python3" ]; then
+    echo "    内置 Python：$PY_SRC"
+    mkdir -p "$PY_DST"
+    rsync -a \
+        --exclude 'include/' --exclude 'share/' --exclude '.extracted' \
+        --exclude 'lib/tcl*' --exclude 'lib/tk*' --exclude 'lib/itcl*' \
+        --exclude 'lib/thread*' --exclude 'lib/libtcl*' --exclude 'lib/libtk*' \
+        --exclude 'lib/pkgconfig/' \
+        --exclude 'lib/python3.*/ensurepip/' --exclude 'lib/python3.*/idlelib/' \
+        --exclude 'lib/python3.*/tkinter/' --exclude 'lib/python3.*/turtledemo/' \
+        --exclude 'lib/python3.*/site-packages/' \
+        --exclude 'lib/python3.*/lib-dynload/_tkinter*' \
+        --exclude 'bin/pip*' --exclude 'bin/idle*' --exclude 'bin/pydoc*' \
+        --exclude 'bin/*-config' \
+        "$PY_SRC" "$PY_DST/"
+    echo "    内置 Python 体积：$(du -sh "$PY_DST" | cut -f1)"
+else
+    echo "    ⚠️ 未找到可打包的 Python；将回退系统 Python（接收方需自备 Python 3）"
+fi
+
 [ -f "$ROOT/build/icon.icns" ] && cp "$ROOT/build/icon.icns" "$APP/Contents/Resources/icon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -63,7 +98,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>com.syny.auth.native</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.0.0</string>
+    <key>CFBundleShortVersionString</key><string>2.2.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
