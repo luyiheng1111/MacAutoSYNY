@@ -6,9 +6,8 @@
 #   ./scripts/build-swift.sh --debug      用 debug 配置构建（更快）
 #   ./scripts/build-swift.sh --skip-icon  跳过图标生成（沿用已有的 build/icon.icns）
 #
-# 与旧版（scripts/build-app.sh = SwiftUI 前端 + Python 后端）的区别：
-#   后端逻辑、后台守护进程、JSON 桥接层全部已用 Swift 重写，
-#   应用包内不再带 syny_auth 包，运行时不依赖 python3。
+# 这是纯 Swift 版构建：后端逻辑、后台守护进程、JSON 桥接层全部用 Swift 实现，
+#   应用包内不再带任何 Python 代码，运行时不依赖 python3（旧版 build-app.sh / build.sh 已删除）。
 #
 # 产物结构：
 #   SYNY.app/Contents/MacOS/SYNY    唯一的可执行文件（GUI / daemon / test / status）

@@ -10,13 +10,6 @@
 SYNY/.build/
 *.app
 
-# ---- Python ----
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-
 # ---- SwiftPM ----
 .build/
 .swiftpm/
