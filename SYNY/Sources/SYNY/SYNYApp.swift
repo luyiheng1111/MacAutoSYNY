@@ -2,7 +2,10 @@ import SwiftUI
 import AppKit
 import Combine
 
-@main
+/// 菜单栏应用主体。
+///
+/// 注意：这里**没有** `@main` —— 进程入口统一由 `Entry.swift` 的 `SYNYEntry`
+/// 负责分发（GUI / daemon / test / status 共用同一个可执行文件）。
 struct SYNYApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 

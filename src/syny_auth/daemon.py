@@ -81,18 +81,22 @@ class Daemon:
 
     # ------------------------------------------------------------------ #
     def _tick(self, cfg: dict) -> None:
-        # WiFi 守卫：未连接 syny WiFi 时完全不探测、不认证，避免在非校园网
-        # （家庭 / 其他 WiFi）环境下后台反复测试连接、触发 captive 弹窗
-        if cfg.get("only_syny_wifi", True) and not core.wifi_is_syny(cfg):
-            ssid = core.current_wifi_ssid()
+        # 校园网守卫：不在校园网时完全不探测、不认证，避免在非校园网
+        # （家庭 / 其他 WiFi）环境下后台反复测试连接、触发 captive 弹窗。
+        #
+        # 判定用 evaluate_campus_access：SSID 读得到就按名称匹配；读不到
+        # （macOS 13+ 未获定位授权时系统一律脱敏）就降级看校园门户是否可达。
+        # 不再直接用 wifi_is_syny——那样在 SSID 被脱敏时会永久暂停后台认证。
+        # reason 就是判定依据原文，直接写进日志，避免再拼一遍文案。
+        on_campus, reason = core.evaluate_campus_access(cfg)
+        if cfg.get("only_syny_wifi", True) and not on_campus:
             if self._wifi_guard != "skip":
-                core.log("当前 WiFi「{}」不是 syny，后台认证已暂停".format(
-                    ssid or "(无 WiFi 连接)"))
+                core.log("暂不认证：{}，后台认证已暂停".format(reason))
                 self._wifi_guard = "skip"
             self._last_state = None
             return
         if self._wifi_guard == "skip":
-            core.log("已连接到 syny WiFi，恢复后台认证")
+            core.log("恢复后台认证：{}".format(reason))
             self._wifi_guard = "syny"
 
         online, portal, detail = core.probe(cfg)
@@ -117,6 +121,14 @@ class Daemon:
             if online:
                 if self._last_state != "online":
                     core.log("网络正常：{}".format(detail))
+                    # 首次判定在线时，顺手搞清楚「是谁让这台机器上得了网」：
+                    # 若门户口径显示本机根本没有认证会话，说明放行来自校园网侧
+                    # （免认证 / MAC 白名单），并不是本软件登录所得 —— 这样用户
+                    # 看到「手动下线没反应」时就知道原因，而不是怀疑软件坏了。
+                    index, _note = core.fetch_online_userindex(cfg, timeout=4)
+                    if not index:
+                        core.log("提示：门户口径显示本机无认证会话，当前联网由校园网侧放行"
+                                 "（免认证 / MAC 白名单），非本软件登录所得，门户注销不会断网")
                 elif self._beats % 20 == 0:
                     core.log("心跳：网络正常（已连续 {} 次）".format(self._beats))
                 self._last_state = "online"

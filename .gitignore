@@ -6,6 +6,7 @@
 # ---- 构建产物 / 应用包 ----
 /SYNY.app/
 /build/
+/dist/
 SYNY/.build/
 *.app
 
@@ -25,6 +26,8 @@ venv/
 .AppleDouble
 .LSOverride
 ._*
+# 例外：DMG 窗口布局模板必须进版本库（Finder 的布局信息就存在 .DS_Store 里）
+!packaging/dmg_layout.DS_Store
 
 # ---- 编辑器 / 工具本地状态（按需可放开）----
 .vscode/

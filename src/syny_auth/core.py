@@ -37,10 +37,21 @@ PORTAL_CACHE_PATH = os.path.join(SUPPORT_DIR, "portal_cache.json")
 # 最近一次登录得到的会话标识 userIndex（手动下线需要），与会话同生命周期
 SESSION_PATH = os.path.join(SUPPORT_DIR, "session.json")
 
-# 备用探针：主探针不可用时依次尝试，全部为 204 型
+# 默认连通性探测地址：大陆节点（小米 ROM 的 204 探针），
+# 校园网内解析与回包都明显快于 google.cn，且不依赖境外线路。
+DEFAULT_CAPTIVE_URL = "http://connect.rom.miui.com/generate_204"
+
+# 历史版本的默认探测地址；加载旧配置时自动迁移到新默认值，
+# 否则改默认值对老用户不生效（配置里存的仍是旧地址）。
+LEGACY_CAPTIVE_URLS = frozenset({"http://www.google.cn/generate_204"})
+
+# 备用探针：主探针不可用时依次尝试。
+# 全部选大陆节点（小米 / vivo / 华为），校园网内一般都有 CDN 就近节点；
+# 最后保留一个微软 connecttest（200 + 正文）作为兜底。
 FALLBACK_PROBES = (
     "http://connect.rom.miui.com/generate_204",
     "http://wifi.vivo.com.cn/generate_204",
+    "http://connectivitycheck.platform.hicloud.com/generate_204",
     "http://www.msftconnecttest.com/connecttest.txt",
 )
 
@@ -57,8 +68,8 @@ DEFAULT_CONFIG = {
     "username": "",
     # 检测间隔（秒）
     "check_interval": 30,
-    # 连通性探测地址（204 探针）
-    "captive_url": "http://www.google.cn/generate_204",
+    # 连通性探测地址（204 探针，默认大陆节点）
+    "captive_url": DEFAULT_CAPTIVE_URL,
     # 校园网认证门户地址：自动识别失败时作为兜底线索
     "portal_hint": "http://172.16.100.201/eportal/index.jsp",
     # 登录时自动拉起后台服务
@@ -157,6 +168,9 @@ def load_config() -> dict:
             cfg.update({k: v for k, v in data.items() if k in DEFAULT_CONFIG})
     except (OSError, ValueError):
         pass
+    # 旧配置里残留的旧默认探测地址自动迁移（用户自定义的地址不动）
+    if cfg.get("captive_url") in LEGACY_CAPTIVE_URLS:
+        cfg["captive_url"] = DEFAULT_CAPTIVE_URL
     try:
         cfg["check_interval"] = max(5, int(cfg["check_interval"]))
     except (TypeError, ValueError):
@@ -225,6 +239,50 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
+def _decode_body(raw: bytes, content_type: str) -> str:
+    """按响应声明的字符集解码正文，解不出来再靠试探兜底。
+
+    为什么必须做这件事：锐捷 eportal 返回的是 **GBK**，且 Content-Type 里往往
+    只写 ``text/html`` 不带 charset。旧实现一律 ``decode("utf-8", "replace")``，
+    后果不只是「门户中文提示显示成乱码」，更严重的是**所有基于中文关键字的判断
+    全部失效** —— 登录时的「已在线」、下线时的「下线/成功」、门户页的「登录」
+    标记、以及识别「WEB认证设备未注册」这类异常页面，都会因为关键字匹配不上
+    而走向错误分支。
+
+    顺序：显式 charset → 严格 UTF-8 → GB18030 → 有损 UTF-8（保证不丢响应）。
+    与 Swift 版 ``HTTP.decode`` 行为保持一致。
+    """
+    if not raw:
+        return ""
+
+    match = re.search(r"charset=([^\s;\"']+)", content_type or "", re.I)
+    if match:
+        declared = match.group(1).strip().lower()
+        alias = {
+            "utf-8": "utf-8", "utf8": "utf-8",
+            "gbk": "gb18030", "gb2312": "gb18030", "gb-2312": "gb18030",
+            "gb18030": "gb18030", "x-gbk": "gb18030", "cp936": "gb18030",
+            "big5": "big5", "big-5": "big5",
+            "iso-8859-1": "latin-1", "latin1": "latin-1",
+            "us-ascii": "ascii", "ascii": "ascii",
+        }.get(declared)
+        if alias:
+            try:
+                return raw.decode(alias)
+            except (LookupError, UnicodeDecodeError):
+                pass
+
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    try:
+        return raw.decode("gb18030")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", "replace")
+
+
 def _http(url: str, data: bytes = None, headers: dict = None, timeout: int = 10):
     """返回 (status, text, headers)；status 为 None 表示网络层失败。"""
     hdrs = {"User-Agent": USER_AGENT}
@@ -233,9 +291,13 @@ def _http(url: str, data: bytes = None, headers: dict = None, timeout: int = 10)
     request = urllib.request.Request(url, data=data, headers=hdrs)
     try:
         with _OPENER.open(request, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8", "replace"), dict(resp.headers)
+            return (resp.status,
+                    _decode_body(resp.read(), resp.headers.get("Content-Type", "")),
+                    dict(resp.headers))
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace"), dict(exc.headers)
+        return (exc.code,
+                _decode_body(exc.read(), exc.headers.get("Content-Type", "")),
+                dict(exc.headers))
     except Exception as exc:  # noqa: BLE001 - 网络异常种类多，统一降级
         return None, "{}: {}".format(type(exc).__name__, exc), {}
 
@@ -330,18 +392,27 @@ def current_wifi_ssid() -> str:
 
     依次尝试 en0/en1/en2（不同 Mac 上 WiFi 接口名不同），用 networksetup
     读取。未关联到任何 WiFi（如接以太网 / 飞行模式）时返回空串。
+
+    networksetup 的输出会跟随系统语言本地化，因此这里强制 LANG/LC_ALL=C
+    以稳定拿到英文输出，同时仍兼容中文标记，双保险。
     """
+    markers = ("Current Wi-Fi Network:", "Wi-Fi 网络:", "Wi-Fi 网络：",
+               "无线网络:", "无线网络：")
+    env = dict(os.environ, LANG="C", LC_ALL="C")
     for iface in ("en0", "en1", "en2"):
         try:
             proc = subprocess.run(
                 ["/usr/sbin/networksetup", "-getairportnetwork", iface],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, env=env,
             )
         except (OSError, subprocess.SubprocessError):
             continue
         out = (proc.stdout or proc.stderr or "").strip()
-        if "Current Wi-Fi Network:" in out:
-            return out.split(":", 1)[1].strip()
+        for marker in markers:
+            if marker in out:
+                ssid = out.split(marker, 1)[1].strip()
+                if ssid:
+                    return ssid
         # 该接口不是 WiFi 或没有关联网络：尝试下一个接口
     return ""
 
@@ -350,11 +421,140 @@ def wifi_is_syny(cfg: dict = None) -> bool:
     """当前是否连接在名称含 syny 的 WiFi 上（大小写不敏感）。
 
     连到其他 WiFi、未关联 WiFi（以太网 / 离线）都返回 False。
+
+    注意：读不到 SSID 时这里恒为 False，**不能**用它单独判断「是否在校园网」——
+    macOS 13 起未获「定位服务」授权的进程一律拿不到 SSID，
+    校园网判定请用 `evaluate_campus_access()`。
     """
     ssid = current_wifi_ssid()
     if not ssid:
         return False
     return "syny" in ssid.lower()
+
+
+def _wifi_device() -> str:
+    """解析 `networksetup -listallhardwareports`，找出 Wi-Fi 对应的设备名。"""
+    env = dict(os.environ, LANG="C", LC_ALL="C")
+    try:
+        proc = subprocess.run(
+            ["/usr/sbin/networksetup", "-listallhardwareports"],
+            capture_output=True, text=True, timeout=5, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    lines = [ln.strip() for ln in (proc.stdout or proc.stderr or "").splitlines()]
+    for idx, line in enumerate(lines):
+        if line.startswith("Hardware Port:") and "Wi-Fi" in line:
+            for follow in lines[idx + 1:]:
+                if follow.startswith("Device:"):
+                    return follow.split(":", 1)[1].strip()
+    return ""
+
+
+def _interface_has_ipv4(name: str) -> bool:
+    """指定接口是否已拿到 IPv4 地址（即已连上某个网络）。"""
+    if not name:
+        return False
+    try:
+        proc = subprocess.run(["/usr/sbin/ipconfig", "getifaddr", name],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return bool((proc.stdout or "").strip())
+
+
+def wifi_status() -> dict:
+    """采集无线网卡状态，供校园网降级判定与诊断输出使用。
+
+    返回 dict：ssid / interface / has_interface / has_address /
+    name_redacted / summary。
+    """
+    device = _wifi_device()
+    has_iface = bool(device)
+    has_addr = _interface_has_ipv4(device)
+    if not device:
+        # 解析失败时退回最常见的接口名（Apple Silicon 与多数 Intel Mac 都是 en0）
+        for candidate in ("en0", "en1", "en2"):
+            if _interface_has_ipv4(candidate):
+                device, has_iface, has_addr = candidate, True, True
+                break
+
+    ssid = current_wifi_ssid()
+    redacted = has_iface and has_addr and not ssid
+    if ssid:
+        summary = ssid
+    elif redacted:
+        summary = "(已连接，但系统未授权读取网络名)"
+    elif has_iface:
+        summary = "(未连接 Wi-Fi)"
+    else:
+        summary = "(无无线网卡)"
+    return {
+        "ssid": ssid,
+        "interface": device,
+        "has_interface": has_iface,
+        "has_address": has_addr,
+        "name_redacted": redacted,
+        "summary": summary,
+    }
+
+
+def _portal_host(cfg: dict) -> str:
+    """从配置的「认证门户」里取出主机名。"""
+    hint = (cfg.get("portal_hint") or "").strip()
+    try:
+        return urllib.parse.urlsplit(hint).hostname or ""
+    except ValueError:
+        return ""
+
+
+def _portal_port(cfg: dict) -> int:
+    hint = (cfg.get("portal_hint") or "").strip()
+    try:
+        return urllib.parse.urlsplit(hint).port or 80
+    except ValueError:
+        return 80
+
+
+def campus_portal_reachable(cfg: dict = None, timeout: float = 1.5) -> bool:
+    """校园门户是否可达（纯 TCP 连接）。
+
+    用 TCP 而非 HTTP：既不会触发 captive 弹窗，也不经过系统代理，
+    判定结果不会被 VPN / 本地代理污染。门户是内网地址（如 172.16.100.201），
+    只有身处校园网才连得上。
+    """
+    cfg = cfg or load_config()
+    host = _portal_host(cfg)
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, _portal_port(cfg)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def evaluate_campus_access(cfg: dict = None):
+    """判断「现在是否处于校园网」，返回 (is_on_campus, reason)。
+
+    与 Swift 版 `PortalClient.evaluateCampusAccess` 同一语义：
+      1. SSID 读得到 → 沿用「名称含 syny」的原语义；
+      2. SSID 读不到（macOS 13+ 未授权定位服务时系统一律脱敏）→ 降级为
+         「校园门户是否可达」。reason 会写进日志，便于排查。
+    """
+    cfg = cfg or load_config()
+    status = wifi_status()
+
+    if status["ssid"]:
+        if "syny" in status["ssid"].lower():
+            return True, "WiFi「{}」名称含 syny".format(status["ssid"])
+        return False, "WiFi「{}」名称不含 syny".format(status["ssid"])
+
+    host = _portal_host(cfg) or "?"
+    situation = "Wi-Fi 已连接但名称不可读" if status["name_redacted"] else "未连接 Wi-Fi"
+    if campus_portal_reachable(cfg):
+        return True, "校园门户 {} 可达（{}）".format(host, situation)
+    return False, "{}，且校园门户 {} 不可达".format(situation, host)
 
 
 def probe(cfg: dict = None, timeout: int = 6):
@@ -499,6 +699,60 @@ def _portal_netloc(cfg: dict = None) -> str:
     return urllib.parse.urlsplit(hint).netloc
 
 
+# 抓取 userIndex 失败时的「内容指纹」，用于给重复失败去重。
+# 守护进程每轮都会尝试抓取，失败原因通常一模一样，没必要反复写日志。
+_CAPTURE_MISS_FINGERPRINT = ""
+
+
+def portal_page_is_abnormal(text: str) -> bool:
+    """门户页面是否处于「学校侧异常」状态。
+
+    实测见过的一种：``/eportal/index.jsp`` 不再返回登录页，而是返回
+    ``<script>alert('WEB认证设备未注册，请确认SAM+/portal/设备上的参数配置是否一致');</script>``。
+    这属于学校认证设备（SAM+ / portal 对接参数）的配置问题，与本软件无关，
+    但会让「抓 userIndex」「打开认证页」全部失效，因此单独识别出来，
+    避免笼统地报成「未含 userIndex」误导排查方向。
+    """
+    if not text:
+        return False
+    lower = text.lower()
+    if "<script>alert(" in lower and "未注册" in text:
+        return True
+    return "WEB认证设备未注册" in text
+
+
+def fetch_online_userindex(cfg: dict = None, timeout: int = 6):
+    """向门户口径查询「本机当前的在线会话」，返回 (userIndex, 门户说明)。
+
+    锐捷 ``InterFace.do?method=getOnlineUserInfo`` 会直接给出当前会话的
+    userIndex；门户侧没有会话时返回
+    ``{"userIndex":null,"result":"fail","message":"获取用户信息失败，用户可能已经下线"}``。
+    这是判断「到底有没有会话可下线」最权威的一手信息，比解析 index.jsp
+    跳转可靠得多（后者在门户页面异常时完全拿不到线索）。
+    userIndex 为空 = 门户侧确认没有会话。
+    """
+    cfg = cfg or load_config()
+    host = _portal_netloc(cfg)
+    if not host:
+        return "", "门户地址未确定"
+    url = "http://{}/eportal/InterFace.do?method=getOnlineUserInfo".format(host)
+    status, text, _ = _http(url, timeout=timeout)
+    if status is None:
+        return "", "门户不可达（{}）".format(text[:60])
+
+    payload = _try_json(text)
+    index = ""
+    message = ""
+    if isinstance(payload, dict):
+        raw_index = payload.get("userIndex")
+        index = str(raw_index).strip() if raw_index else ""
+        message = str(payload.get("message") or payload.get("msg") or "")
+    if index:
+        save_session_userindex(index)
+        return index, message
+    return "", message or (text or "").strip()[:120]
+
+
 def capture_userindex_if_online(cfg: dict = None, timeout: int = 8) -> str:
     """已在线时访问门户入口，门户会 302 跳到 success.jsp?userIndex=...，借此拿到会话标识。
 
@@ -507,20 +761,41 @@ def capture_userindex_if_online(cfg: dict = None, timeout: int = 8) -> str:
     在线时才可能拿到，拿到即持久化，供「手动下线」使用（即便本次登录不是由本软件发起）。
     """
     cfg = cfg or load_config()
+    global _CAPTURE_MISS_FINGERPRINT
     host = _portal_netloc(cfg)
     if not host:
+        log("抓取 userIndex：门户地址未知，跳过")
         return ""
     url = "http://{}/eportal/index.jsp".format(host)
     status, body, headers = _http(url, timeout=timeout)
     if status is None:
+        log("抓取 userIndex：{} 连接失败".format(url))
         return ""
     hay = (headers.get("Location", "") or "") or (body or "")
     m = re.search(r"userIndex=([^&\s\"'<>]+)", hay)
     if m:
         ui = urllib.parse.unquote(m.group(1).strip())
         if ui:
+            _CAPTURE_MISS_FINGERPRINT = ""
             save_session_userindex(ui)
             return ui
+
+    # 失败很常见（门户口径无会话 / 门户页面异常 / 该门户不是本网段的认证设备），
+    # 且守护进程会周期性重试，因此按「内容指纹」去重：同样的失败只记一次，
+    # 避免每轮都往日志里灌一段 HTML 片段。
+    fingerprint = "{}|{}".format(status, hay[:120])
+    if fingerprint == _CAPTURE_MISS_FINGERPRINT:
+        return ""
+    _CAPTURE_MISS_FINGERPRINT = fingerprint
+
+    if portal_page_is_abnormal(hay):
+        log("抓取 userIndex：门户认证页异常（学校侧配置问题，非本软件故障），"
+            "{} 返回：{}".format(url, hay[:90]))
+    else:
+        # 常见于「该门户不是当前网段的认证设备」或「本次会话非认证页建立」，
+        # 记下来，方便判断手动下线失败的根因。
+        log("抓取 userIndex：{} 返回 HTTP {}，未含 userIndex（响应片段：{}）".format(
+            url, status, hay[:80]))
     return ""
 
 
@@ -776,19 +1051,55 @@ def logout(cfg: dict = None, timeout: int = 12):
     调用锐捷标准的 InterFace.do?method=logout 接口，需要 userIndex 会话标识。
     userIndex 来自上次登录响应，或已在线时从门户跳转自动抓取；若都没有，
     则先尝试现场抓取一次，仍失败则提示用户先登录。
+
+    下线后追加一次连通性复检：若校园网启用了无感知认证（按设备 MAC 自动
+    放行），门户注销不会立刻断网。此时如实提示「门户已接受注销，但网络仍
+    可访问」，而不是简单报成功或失败。
     """
     cfg = cfg or load_config()
-    user_index = load_session_userindex()
-    if not user_index:
-        # 现场补抓：当前若确实在线，门户会给出 userIndex
-        user_index = capture_userindex_if_online(cfg, timeout=timeout)
-    if not user_index:
-        return False, ("未检测到登录会话标识（userIndex）。\n"
-                       "请先通过本软件登录，或在浏览器认证页点击「下线」后重试。")
-
     host = _portal_netloc(cfg)
+    user_index = load_session_userindex()
+    # 门户口径结论：本机是不是压根就没有可注销的会话。
+    # 区分「拿不到 userIndex」和「本来就没有会话」很重要 —— 前者像软件故障，
+    # 后者是网络放行机制决定的客观事实，提示文案完全不同。
+    portal_session_absent = False
+    portal_note = ""
+
+    log("手动下线：门户={} userIndex={}".format(
+        host or "(未确定)", user_index or "(无缓存)"))
+
+    if not user_index:
+        # 第一顺位：问门户口径。getOnlineUserInfo 是权威答案，且直接给 userIndex。
+        portal_index, portal_note = fetch_online_userindex(cfg, timeout=timeout)
+        if portal_index:
+            user_index = portal_index
+            log("手动下线：门户口径返回会话 userIndex={}，直接使用".format(portal_index))
+        else:
+            portal_session_absent = True
+            log("手动下线：门户口径确认本机无在线会话（{}）".format(portal_note))
+            # 第二顺位：部分门户未实现 getOnlineUserInfo，仍按老路子抓一次跳转兜底。
+            user_index = capture_userindex_if_online(cfg, timeout=timeout)
+            if user_index:
+                portal_session_absent = False
+                log("手动下线：改由门户跳转抓到 userIndex={}".format(user_index))
+
     if not host:
-        return False, "无法确定认证门户地址，请在「高级设置 → 认证门户」中填写。"
+        message = "无法确定认证门户地址，请在「高级设置 → 认证门户」中填写。"
+        log("手动下线失败：{}".format(message), "WARN")
+        return False, message
+
+    if not user_index:
+        if portal_session_absent:
+            message = ("门户（{}）侧确认本机当前没有在线会话，因此没有可注销的登录。\n\n"
+                       "你的网络很可能由校园网侧「免认证 / MAC 白名单（无感知认证）」放行，"
+                       "这种情况门户注销无法断开网络。\n"
+                       "如需断开，请在系统 Wi-Fi 菜单里断开该网络，或改用有线 / 热点。").format(host)
+            log("手动下线：无可注销会话（{}）".format(portal_note), "WARN")
+            return False, message
+        message = ("未检测到登录会话标识（userIndex）。\n"
+                   "请先通过本软件登录，或在浏览器认证页点击「下线」后重试。")
+        log("手动下线失败：{}".format(message), "WARN")
+        return False, message
 
     url = "http://{}/eportal/InterFace.do?method=logout".format(host)
     form = "userIndex=" + urllib.parse.quote(user_index, safe="")
@@ -802,26 +1113,48 @@ def logout(cfg: dict = None, timeout: int = 12):
         timeout=timeout,
     )
     if status is None:
-        return False, "下线请求失败：{}".format(text)
+        message = "下线请求失败：{}".format(text)
+        log("手动下线失败：{}".format(message), "WARN")
+        return False, message
 
+    body = (text or "").strip()
+    log("手动下线：HTTP {} 响应={}".format(status, body[:200]))
+
+    succeeded = False
+    message = ""
     payload = _try_json(text)
     if payload is not None:
         result = str(payload.get("result", "")).strip().lower()
         message = payload.get("message") or payload.get("msg") or ""
         if result in ("success", "logout") or "成功" in message or "下线" in message:
-            clear_session_userindex()
-            if cfg.get("notify", False):
-                notify("SYNY 校园网", "已手动下线")
-            return True, message or "已下线成功"
+            succeeded = True
+    if not succeeded:
+        low = body.lower()
+        if "success" in low or "下线" in body or "成功" in body:
+            succeeded = True
+            message = "已下线成功"
 
-    low = (text or "").lower()
-    if "success" in low or "下线" in low or "成功" in low:
-        clear_session_userindex()
-        if cfg.get("notify", False):
-            notify("SYNY 校园网", "已手动下线")
-        return True, "已下线成功"
+    if not succeeded:
+        detail = message or body[:160]
+        log("手动下线失败：HTTP {} {}".format(status, detail), "WARN")
+        return False, "下线失败(HTTP {})：{}".format(status, detail)
 
-    return False, "下线失败(HTTP {})：{}".format(status, (text or "")[:160])
+    clear_session_userindex()
+
+    # 复检：门户接受注销，但无感知认证会立刻重新放行，用户会感觉「下线没生效」
+    still_online = bool(probe(cfg, timeout=4)[0])
+    final_message = message or "已下线成功"
+    if still_online:
+        final_message += ("\n\n注意：注销请求已被门户接受，但复检显示网络仍可访问。"
+                          "这通常意味着该网络启用了无感知认证（按设备 MAC 自动"
+                          "放行），门户注销不会立即断网。")
+        log("手动下线：门户已接受注销，但复检仍在线（疑似无感知认证）", "WARN")
+    else:
+        log("手动下线成功：{}".format(final_message))
+
+    if cfg.get("notify", False):
+        notify("SYNY 校园网", "网络仍可访问（已提交下线）" if still_online else "已手动下线")
+    return True, final_message
 
 
 # --------------------------------------------------------------------------- #

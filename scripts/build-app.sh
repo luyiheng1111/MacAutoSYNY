@@ -1,5 +1,8 @@
 #!/bin/sh
-# 构建原生 SYNY.app —— SwiftUI 前端（SwiftPM）+ Python 后端（src/syny_auth）
+# 构建 SYNY.app —— SwiftUI 前端（SwiftPM）+ Python 后端（src/syny_auth）
+#
+# ⚠️ 这是「过渡版」构建：产物内仍带 Python 后端，运行需本机有 python3。
+#    纯 Swift 版（无 Python 依赖、开箱即用）请用 ./scripts/build-swift.sh
 #
 #   ./scripts/build-app.sh              构建到项目根目录 SYNY.app
 #   ./scripts/build-app.sh --install    构建并安装到 /Applications
