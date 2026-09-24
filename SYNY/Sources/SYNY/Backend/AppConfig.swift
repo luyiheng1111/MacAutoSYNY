@@ -11,22 +11,37 @@ struct AppConfig {
         "auto_start", "notify", "logging", "only_syny_wifi", "enabled",
     ]
 
-    /// 默认连通性探测地址：改用大陆节点（小米 ROM 的 204 探针），
-    /// 校园网内解析与回包都明显快于 google.cn，且不依赖境外线路。
-    static let defaultCaptiveURL = "http://connect.rom.miui.com/generate_204"
+    /// 默认连通性探测地址：`http://captive.apple.com/hotspot-detect.html`。
+    ///
+    /// 为什么选它：这与 **macOS 自带登录页（CNA）使用的探测地址完全相同**。
+    /// 本软件的全部意义就是「抢在系统弹出登录页之前把认证做完」，那么判据就该
+    /// 和系统保持一致 —— 我们看到 `Success`，系统那次探测也会通过，两边不会打架。
+    ///
+    /// 形态是 **200 + 正文一句 `Success`**（实测 68 字节），不是 204；
+    /// 且必须用 `http://`（用 https 就看不到门户插进来的 302 劫持了）。
+    ///
+    /// ⚠️ 换这个常量时务必同步检查 `PortalClient.probe` 的判定逻辑与
+    /// `probeContentMarker`，否则新探针会被一律判成「未联网」，
+    /// 每轮白跑一轮认证。204 型探针（如 `…/generate_204`）依然受支持。
+    static let defaultCaptiveURL = "http://captive.apple.com/hotspot-detect.html"
 
     /// 历史版本的默认探测地址。加载旧配置时自动迁移到 `defaultCaptiveURL`，
     /// 否则改默认值对老用户不生效（配置里存的仍是旧地址）。
+    ///
+    /// 只放**真正当过默认值**的地址：放进来就意味着用户手工填写它也会被改掉。
+    /// 其它 204 型探针（vivo / 华为 / 微软）只是 `PortalClient.fallbackProbes`
+    /// 里的备选，用户可以自由指定，别拦。
     static let legacyCaptiveURLs: Set<String> = [
         "http://www.google.cn/generate_204",
+        "http://connect.rom.miui.com/generate_204",
     ]
 
     // 校园网账号
     var username = ""
     // 检测间隔（秒）
     var checkInterval = 30
-    // 连通性探测地址（204 探针，默认大陆节点）
-    var captiveURL = "http://connect.rom.miui.com/generate_204"
+    // 连通性探测地址（默认 Apple 捕获探测页：200 + "Success"，与 macOS 登录页同源）
+    var captiveURL = "http://captive.apple.com/hotspot-detect.html"
     // 校园网认证门户地址：自动识别失败时作为兜底线索
     var portalHint = "http://172.16.100.201/eportal/index.jsp"
     // 登录时自动拉起后台服务

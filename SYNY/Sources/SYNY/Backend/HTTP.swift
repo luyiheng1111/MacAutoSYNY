@@ -37,14 +37,42 @@ enum HTTP {
 
     private static let delegate = NoRedirectDelegate()
 
+    /// 等待网络就绪的上限（秒）。
+    ///
+    /// 这个值同时决定 `waitsForConnectivity` 能等多久，必须覆盖**一次完整的
+    /// Wi-Fi 重关联 + DHCP**。实测踩到：用户切换「私有 Wi-Fi 地址」后，链路有
+    /// 近 1 分钟完全不可用；上限只有 12 秒时，请求恰好卡在「链路就绪的前一刻」
+    /// 超时 —— 下一轮虽然能连上，认证窗口却已经被 macOS 系统登录页（CNA）或
+    /// 网关的无感知认证抢走，用户看到的就是「后台服务没能完成重新认证」。
+    ///
+    /// 放宽到 30 秒后，第一个请求会一直挂在等待中，**链路一恢复立刻发出去**，
+    /// 这才是能抢在 CNA 之前完成认证的姿态。
+    /// 代价：真的长时间没有网络时每轮会等满这个上限，对后台服务可以接受
+    /// —— 没有链路时本来也没别的事可做。
+    private static let resourceTimeout: TimeInterval = 30
+
     private static let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false
         configuration.httpCookieAcceptPolicy = .never
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         configuration.timeoutIntervalForRequest = 15
-        configuration.timeoutIntervalForResource = 30
-        configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForResource = resourceTimeout
+
+        // 断网 / Wi-Fi 重连的瞬间，系统还没确认「有没有网」，此时若不等一等，
+        // URLSession 会**立刻**抛 `NSURLErrorNotConnectedToInternet`
+        // （本地化文案就是「似乎已断开与互联网的连接。」）。
+        // 实测踩到的后果：把「私有 Wi-Fi 地址」关掉后 Wi-Fi 重关联的那两分钟里，
+        // 连给**内网门户**（172.16.100.201）的登录请求都被瞬间判失败，
+        // 日志只剩一片 `登录请求失败：NSURLError`，看起来就是「登录功能坏了」。
+        // 打开 waitsForConnectivity 后，请求会静候网络就绪再发，重连一到位就自动继续。
+        configuration.waitsForConnectivity = true
+
+        // 显式允许「按流量计费 / 低数据模式」的网络：
+        // 校园网常被系统标记为受限网络，若被拦下同样表现为「连不上互联网」。
+        configuration.allowsExpensiveNetworkAccess = true
+        configuration.allowsConstrainedNetworkAccess = true
+
         // 绕过系统代理，防止误判网络状态
         configuration.connectionProxyDictionary = [:]
         return URLSession(configuration: configuration,
@@ -95,7 +123,11 @@ enum HTTP {
         }
         task.resume()
 
-        if semaphore.wait(timeout: .now() + timeout + 10) == .timedOut {
+        // 外层等待必须 ≥ 会话的「等网络」上限，否则 URLSession 还在等链路、
+        // 我们自己先把请求 cancel 了 —— 那 waitsForConnectivity 就白开了
+        // （这正是之前「后台服务在重连期间完全没动作」的隐藏元凶）。
+        let wait = max(timeout, resourceTimeout) + 3
+        if semaphore.wait(timeout: .now() + wait) == .timedOut {
             task.cancel()
             return HTTPResult(status: nil, error: "请求超时：\(url)")
         }

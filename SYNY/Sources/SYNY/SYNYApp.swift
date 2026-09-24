@@ -70,6 +70,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.closeStrayWindows()
         }
+
+        // 菜单栏面板上的「WiFi 设置教学」按钮走通知进来：面板是 NSPopover(.transient)，
+        // 开窗时必须由这里主动收起，否则会留下一个失去焦点的空面板挂在状态栏下。
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(handleShowWifiGuide),
+                                               name: .synyShowWifiGuide,
+                                               object: nil)
+
+        // 首次启动自动弹一次「改 Wi-Fi 设置」教学。刻意放在 closeStrayWindows 之后：
+        // 那个方法会关掉所有可见的非 NSPanel 窗口，虽然教学窗口已在其中被豁免，
+        // 错开时序仍更稳妥。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+            self?.presentWifiGuideIfNeeded()
+        }
+
+        // 启动即检查后台服务的落点是否还有效：App 被移动 / 项目目录被删之后，
+        // LaunchAgent 里记的绝对路径会变成死链，服务静默失效。放在这里检查，
+        // 就不用等用户主动点开面板才暴露问题（面板出现时还会再调一次，幂等）。
+        // 注意：这里只做这一次体检，不启动完整的状态刷新循环（那个由面板负责），
+        // 避免菜单栏常驻空转、每隔几秒就去探一次网络。
+        model.serviceHealthCheck()
+
         debugLog("launched; statusItem=\(item.button != nil); "
                  + "statusWinVisible=\(item.button?.window?.isVisible ?? false)")
 
@@ -91,16 +113,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 注意：必须放行状态栏项所在的 `NSStatusBarWindow`——它只是普通 `NSWindow`、
     /// 并非 `NSPanel`，若被一并关掉，状态栏按钮的窗口将 `isVisible == false`，
     /// `NSPopover.show(relativeTo:of:)` 会因此静默失败，表现为「点菜单栏图标无反应」。
+    /// 同理放行教学窗口：它是普通窗口，正是我们要留下的那一个。
     private func closeStrayWindows() {
         let popoverWindow = popover.contentViewController?.view.window
         let statusWindow = statusItem?.button?.window
+        let guideWindow = WifiGuideWindow.existingWindow
         for window in NSApplication.shared.windows where window.isVisible {
             if window is NSPanel { continue }
             if let popoverWindow, window === popoverWindow { continue }
             if let statusWindow, window === statusWindow { continue }
+            if let guideWindow, window === guideWindow { continue }
             window.orderOut(nil)
             window.close()
         }
+    }
+
+    // MARK: - Wi-Fi 设置教学
+
+    /// 首次启动自动弹教学（跨启动只弹一次，由 `WifiGuideWindow` 自行记账）。
+    private func presentWifiGuideIfNeeded() {
+        WifiGuideWindow.showIfNeeded()
+    }
+
+    /// 面板按钮 / 其它入口请求打开教学：先收 popover，再开窗。
+    @objc private func handleShowWifiGuide() {
+        popover.performClose(nil)
+        WifiGuideWindow.show()
     }
 
     /// 同步 popover 尺寸为「内容自适应、且不超过用户上限」的高度。

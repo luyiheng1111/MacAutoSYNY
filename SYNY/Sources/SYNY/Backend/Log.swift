@@ -9,6 +9,10 @@ enum Log {
     private static let maxBytes = 1024 * 1024
     private static let keepLines = 800
 
+    /// 「限频提示」上次写出的时间，key 为调用方给的 tag。
+    private static var throttleStamps: [String: Date] = [:]
+    private static let throttleLock = NSLock()
+
     static var enabled: Bool { AppConfig.load().logging }
 
     static func write(_ message: String, level: String = "INFO") {
@@ -30,8 +34,28 @@ enum Log {
         }
     }
 
+    /// 同一个 tag 在 `window` 秒内最多写一次。
+    ///
+    /// 用于周期性任务里的「环境性」提示：这类话每轮都成立（比如「链路尚未就绪」），
+    /// 但既不能每 5 秒刷一遍把日志淹掉，也不能像 `writeOnce` 那样一整个进程只写一次
+    /// —— 守护进程要跑好几天，只写一次等于事后完全看不到。
+    static func writeThrottled(_ message: String, tag: String,
+                               window: TimeInterval = 300, level: String = "INFO") {
+        let now = Date()
+        throttleLock.lock()
+        let last = throttleStamps[tag]
+        let shouldWrite = last == nil || now.timeIntervalSince(last!) >= window
+        if shouldWrite { throttleStamps[tag] = now }
+        throttleLock.unlock()
+        guard shouldWrite else { return }
+        write(message, level: level)
+    }
+
     static func clear() {
         try? FileManager.default.removeItem(atPath: AppPaths.logPath)
+        throttleLock.lock()
+        throttleStamps.removeAll()
+        throttleLock.unlock()
     }
 
     static func readTail(_ maxLines: Int = 300) -> String {

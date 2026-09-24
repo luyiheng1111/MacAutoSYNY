@@ -27,7 +27,7 @@ struct SYNYConfig: Codable, Equatable {
     static let fallback = SYNYConfig(
         username: "",
         checkInterval: 30,
-        captiveURL: "http://connect.rom.miui.com/generate_204",
+        captiveURL: "http://captive.apple.com/hotspot-detect.html",
         portalHint: "",
         autoStart: true,
         notify: true,

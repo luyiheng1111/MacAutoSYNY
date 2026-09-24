@@ -20,6 +20,8 @@ final class DaemonRunner {
     private var lastFailNotify = Date.distantPast
     private var lastFailMessage = ""
     private let lock = NSLock()
+    /// 网络路径监视器：让「发现断网」从轮询变成事件驱动（见该类型注释）。
+    private let pathMonitor = PathMonitor()
 
     private var stopping: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -48,11 +50,16 @@ final class DaemonRunner {
         try? "\(getpid())".write(toFile: AppPaths.pidPath, atomically: true, encoding: .utf8)
         Log.write("后台服务启动 pid=\(getpid()) 账号=\(config.username) 间隔=\(config.checkInterval)s")
 
+        // 事件驱动：网络路径一变就立刻进入下一轮，抢在 macOS 弹出
+        // 「系统默认登录页」之前完成认证。
+        pathMonitor.start()
+
         while !stopping {
             // 每轮热加载配置，界面上改完立即生效
             let current = AppConfig.load()
             tick(current)
-            sleep(seconds: current.checkInterval)
+            // 不再死等 check_interval：期间网络有变化会被立刻唤醒
+            pathMonitor.waitForChange(upTo: current.checkInterval)
         }
 
         try? FileManager.default.removeItem(atPath: AppPaths.pidPath)
@@ -162,12 +169,22 @@ final class DaemonRunner {
             return
         }
 
+        // 本轮根本没机会发起认证（链路尚未就绪）——这不是「认证失败」，
+        // 不该记 WARN、更不该弹失败通知。安静等链路事件，就绪后立刻重来。
+        guard result.attempted else {
+            lastFailMessage = ""
+            lastState = "offline"
+            return
+        }
+
         // 失败后快速重试两次：刚断线时门户可能尚未就绪，
         // 立刻放弃会白等一个完整检测周期。
         var message = result.message
         for _ in 0..<2 {
-            if stopping || !result.attempted { break }
-            sleep(seconds: 3)
+            if stopping { break }
+            // 用「等网络变化」代替死睡 3 秒：链路一变立刻重试，
+            // 而不是白睡满 —— 抢认证就抢在这几秒上。
+            pathMonitor.waitForChange(upTo: 3)
             if stopping { return }
             result = PortalClient.authenticate(config)
             message = result.message
@@ -181,6 +198,7 @@ final class DaemonRunner {
                 lastState = "online"
                 return
             }
+            if !result.attempted { break }
         }
 
         // 失败日志按内容去重，避免每轮刷同一条

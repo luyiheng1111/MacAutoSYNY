@@ -19,7 +19,10 @@ enum ServiceController {
         let outPath = config.logging ? AppPaths.logPath : "/dev/null"
         return [
             "Label": AppPaths.label,
-            "ProgramArguments": [AppPaths.executablePath, "daemon"],
+            // 必须用**稳定落点**（见 AppPaths.serviceExecutablePath）：
+            // 早期版本直接写 AppPaths.executablePath，等于把服务钉死在「当前运行的
+            // 那个副本」上——在项目目录里启用后台认证，项目一移动服务就静默失效。
+            "ProgramArguments": [AppPaths.serviceExecutablePath, "daemon"],
             "EnvironmentVariables": ["SYNY_DAEMON": "1"],
             "WorkingDirectory": AppPaths.supportDir,
             "RunAtLoad": config.autoStart,
@@ -55,6 +58,53 @@ enum ServiceController {
     static func agentRunning() -> Bool { agentState().running }
     static func agentPID() -> Int? { agentState().pid }
 
+    // MARK: - 服务落点健康检查（防「项目一移动就静默失效」）
+
+    /// 读取已注册服务实际指向的可执行文件路径（plist 中 `ProgramArguments` 的第一项）。
+    static func agentProgramPath() -> String {
+        guard let data = FileManager.default.contents(atPath: AppPaths.plistPath),
+              let object = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let dict = object as? [String: Any],
+              let args = dict["ProgramArguments"] as? [String],
+              let first = args.first else { return "" }
+        return first
+    }
+
+    /// 服务定义是否已成「死链」—— plist 在，但它指向的可执行文件已经不存在。
+    ///
+    /// 这正是「项目一移动、后台认证就没了」的直接判据。过去这里**完全静默**：
+    /// 用户只看到「服务没在跑」，既没有报错也没有线索，只能靠翻 plist 才发现。
+    static func agentProgramMissing() -> Bool {
+        guard agentInstalled() else { return false }
+        let path = agentProgramPath()
+        guard !path.isEmpty else { return true }
+        return !FileManager.default.isExecutableFile(atPath: path)
+    }
+
+    /// 启动时自检并尽量自愈。返回一句可供界面展示的说明；无需处理时返回空串。
+    ///
+    /// 修复策略：失效的旧落点 → 若「应用程序」里有可用副本就自动改指过去；
+    /// 否则保留失效定义但**明确告知**用户（不再静默）。
+    @discardableResult
+    static func repairAgentIfBroken() -> String {
+        guard agentProgramMissing() else { return "" }
+        let stale = agentProgramPath()
+        let shown = stale.isEmpty ? "(未记录)" : stale
+
+        if AppPaths.hasInstalledCopy, installAgent() {
+            let message = "后台服务原先指向的程序已不存在（\(shown)），"
+                + "已自动改指到 \(AppPaths.serviceExecutablePath)。"
+            Log.write("后台服务落点自愈：\(message)", level: "WARN")
+            return message
+        }
+
+        let message = "后台服务指向的程序已不存在（\(shown)），自动认证已无法启动。\n"
+            + "请把 SYNY.app 放进「应用程序」文件夹，再从那里打开本应用并重新点"
+            + "「保存并启用后台认证」。"
+        Log.write("后台服务落点失效且无法自动修复：\(message)", level: "ERROR")
+        return message
+    }
+
     /// 仅把服务从 launchd 卸载，不删除 plist 文件。
     private static func bootout() {
         let target = "gui/\(getuid())/\(AppPaths.label)"
@@ -85,6 +135,14 @@ enum ServiceController {
         }
 
         let target = "gui/\(getuid())"
+        // 必须**先 enable 再 bootstrap**：
+        // `bootout()` 末尾的 `launchctl unload -w` 会往覆盖库里写一条
+        // Disabled=true；而带禁用标记的服务用 bootstrap 加载时会直接返回
+        // `Bootstrap failed: 5: Input/output error`（报错信息完全不提示真实原因，
+        // 极难排查）。把顺序反过来，这个问题就永远不会出现。
+        Shell.capture("/bin/launchctl", ["enable", "gui/\(getuid())/\(AppPaths.label)"],
+                      timeout: 10)
+
         var messages: [String] = []
         var result = Shell.capture("/bin/launchctl",
                                    ["bootstrap", target, AppPaths.plistPath], timeout: 20)
@@ -113,7 +171,15 @@ enum ServiceController {
             return false
         }
 
-        Log.write("后台服务已安装并启动")
+        let program = AppPaths.serviceExecutablePath
+        if AppPaths.servicePathIsStable {
+            Log.write("后台服务已安装并启动（指向 \(program)）")
+        } else {
+            // 兜底落点：必须说清楚，否则项目一挪走就又是一次「服务莫名失效」
+            Log.write("后台服务已安装并启动（指向 \(program)）；"
+                + "「应用程序」里暂无 SYNY.app 副本，服务仍与当前目录绑定，"
+                + "移动或删除该目录会导致后台认证失效。", level: "WARN")
+        }
         return true
     }
 

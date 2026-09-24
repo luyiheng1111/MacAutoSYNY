@@ -14,7 +14,7 @@ final class AppModel: ObservableObject {
     @Published var username = ""
     @Published var password = ""
     @Published var checkInterval = "30"
-    @Published var captiveURL = "http://connect.rom.miui.com/generate_204"
+    @Published var captiveURL = "http://captive.apple.com/hotspot-detect.html"
     @Published var portalHint = ""
     @Published var autoStart = true
     @Published var notify = true
@@ -38,6 +38,12 @@ final class AppModel: ObservableObject {
     @Published var busy = false
     @Published var advancedOpen = false
     @Published var showPassword = false
+
+    /// 用户是否已在教学窗口点过「我知道了」。
+    ///
+    /// 未确认 → 面板主区域显示「请先改 Wi-Fi 设置」提示卡；
+    /// 确认后 → 收起，回看入口只留在「高级设置」。
+    @Published var wifiGuideAcknowledged = WifiGuideState.acknowledged
 
     // MARK: 面板尺寸（界面偏好，存 UserDefaults）
     // 目标：底部不留多余空白——面板高度 = 内容自然高度，且不超过用户设定的上限；
@@ -67,20 +73,59 @@ final class AppModel: ObservableObject {
 
     private var didLoadForm = false
     private var started = false
+    private var didCheckServiceHealth = false
     private var timer: Timer?
     private var lastOpAt = Date.distantPast
+    private var guideObserver: NSObjectProtocol?
     private let work = DispatchQueue(label: "com.syny.backend", qos: .userInitiated)
 
     // MARK: - 生命周期
+    //
+    // 为什么教学状态不用 `@AppStorage` 直接盯 `UserDefaults`：
+    // 实测那一套对「本进程之外的写入」不会刷新，而这里要的恰恰是**点完「我知道了」
+    // 立刻收起面板提示卡**。走进程内通知是确定性的：教学窗口写完键就 `post`，
+    // 谁在听谁立刻更新，不依赖 UserDefaults 的跨进程变更通知。
+    init() {
+        // 注册必须在 init 而不是 bootstrap()：首次启动时教学窗口比面板先出现，
+        // 用户完全可能先点确认、之后才第一次打开面板。
+        guideObserver = NotificationCenter.default.addObserver(
+            forName: .synyWifiGuideAcknowledged, object: nil, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.async { self?.wifiGuideAcknowledged = true }
+        }
+    }
+
+    deinit {
+        if let guideObserver { NotificationCenter.default.removeObserver(guideObserver) }
+    }
+
     func bootstrap() {
         guard !started else { return }
         started = true
         refresh()
+        serviceHealthCheck()
         let t = Timer(timeInterval: 8, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+    }
+
+    /// 自检后台服务的「落点」是否还活着（进程启动时与面板首次出现时各调一次，
+    /// 实际只执行一次——它是幂等的）。
+    ///
+    /// 背景：LaunchAgent 的 `ProgramArguments` 存的是绝对路径。早期版本写的是
+    /// 「此刻运行的那个副本」，于是从项目目录启用过服务之后，项目一移动 / 删除，
+    /// launchd 就再也拉不起守护进程，而且**毫无提示**——界面上只显示「未启用」。
+    /// 这里把这件事变成可感知、可自愈的动作。
+    func serviceHealthCheck() {
+        guard !didCheckServiceHealth else { return }
+        didCheckServiceHealth = true
+        work.async { [weak self] in
+            let note = ServiceController.repairAgentIfBroken()
+            guard !note.isEmpty else { return }
+            DispatchQueue.main.async { self?.setMessage(note, kind: .warn) }
+        }
     }
 
     // MARK: - 状态刷新
@@ -106,7 +151,16 @@ final class AppModel: ObservableObject {
         serviceRunning = payload.service.running
         wifiSSID = payload.wifi.ssid
         wifiIsSyny = payload.wifi.isSyny
+        // 下面三项此前只声明、从未赋值（初值一直是 false），于是界面永远落到
+        // 「未检测到 Wi-Fi 接口」那个 else 分支 —— 明明无线网卡正常、IP 也拿到了，
+        // 却把「名称被系统脱敏」误报成「没有无线网卡」，让人以为整个 WiFi 判定失效。
+        wifiHasInterface = payload.wifi.hasWifiInterface
+        wifiHasAddress = payload.wifi.wifiHasAddress
+        wifiNameIsRedacted = payload.wifi.nameIsRedacted
         logging = payload.config.logging
+        // 兜底：正常路径靠 `.synyWifiGuideAcknowledged` 通知即时更新；
+        // 这里跟着周期刷新再对一次，避免「键已写、界面没跟上」的错位。
+        wifiGuideAcknowledged = WifiGuideState.acknowledged
         logContent = payload.logTail.isEmpty ? "(暂无日志内容)" : payload.logTail
 
         if !didLoadForm {

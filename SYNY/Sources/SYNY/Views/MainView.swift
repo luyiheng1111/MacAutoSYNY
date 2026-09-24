@@ -13,6 +13,11 @@ struct SYNYPanel: View {
                 HeaderView()
                 AccountCard()
                 PrimaryButton()
+                // 提示卡只服务于「还没读过教学」的用户：读过就收起（回看入口在「高级设置」），
+                // 否则它会成为长期占着面板的一块常驻噪音。
+                if !model.wifiGuideAcknowledged {
+                    WifiGuideTipCard()
+                }
                 AdvancedSection()
                 Divider().padding(.vertical, 2)
                 FooterView()
@@ -164,6 +169,86 @@ private struct PrimaryButton: View {
     }
 }
 
+// MARK: - Wi-Fi 设置提示（首次启动教学的两个入口）
+//
+// 教学窗口只在首次启动自动弹一次，而真正会被「私有 Wi-Fi 地址＝轮换」坑到的人，
+// 往往是用了一两周之后才发现「怎么老让重新认证」。所以结论要随时找得回来，
+// 但不能长期占着面板主区域 —— 分工是：
+//   · WifiGuideTipCard：还没点过「我知道了」时，在主区域醒目提示（一次性）；
+//   · WifiGuideRow    ：点过之后收进「高级设置」，随时可回看。
+
+private struct WifiGuideTipCard: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(Palette.warn)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("首次使用：请先改 Wi-Fi 设置")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("「私有 Wi-Fi 地址」要设为「固定」或「关闭」，否则每次连网都换 MAC，门户会反复要求认证。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+
+            Button("查看教学") {
+                NotificationCenter.default.post(name: .synyShowWifiGuide, object: nil)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .fixedSize()
+        }
+        .padding(12)
+        .background(Palette.warn.opacity(0.10),
+                    in: RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
+                .strokeBorder(Palette.warn.opacity(0.35), lineWidth: 1)
+        )
+    }
+}
+
+/// 「高级设置」里的教学回看入口：外观中性，不抢主操作的位置。
+private struct WifiGuideRow: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "questionmark.circle")
+                .font(.system(size: 14))
+                .foregroundStyle(.secondary)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Wi-Fi 设置教学")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("「私有 Wi-Fi 地址」需设为「固定」或「关闭」，否则每次连网换 MAC、门户会反复要求认证。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+
+            Button("查看") {
+                NotificationCenter.default.post(name: .synyShowWifiGuide, object: nil)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .fixedSize()
+        }
+        .padding(12)
+        .background(Palette.card,
+                    in: RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: Metrics.cardRadius, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+        )
+    }
+}
+
 // MARK: - 高级设置（默认收起）
 private struct AdvancedSection: View {
     @EnvironmentObject var model: AppModel
@@ -171,6 +256,7 @@ private struct AdvancedSection: View {
     var body: some View {
         DisclosureGroup(isExpanded: $model.advancedOpen) {
             VStack(alignment: .leading, spacing: Metrics.sectionGap) {
+                WifiGuideRow()
                 ServiceCard()
                 ActionsCard()
                 AppearanceCard()
@@ -231,7 +317,7 @@ private struct ServiceCard: View {
                 .toggleStyle(.switch)
             Toggle("认证结果发送系统通知", isOn: $model.notify)
                 .toggleStyle(.switch)
-            Toggle("仅 syny WiFi 下认证", isOn: $model.onlySynyWifi)
+            Toggle("仅在校园网内认证", isOn: $model.onlySynyWifi)
                 .toggleStyle(.switch)
             
             // WiFi 状态显示
@@ -246,6 +332,11 @@ private struct ServiceCard: View {
                             Text("已连接但名称被系统脱敏")
                                 .font(.system(size: 12))
                                 .foregroundStyle(.secondary)
+                            // 名称读不到时，把「校园网判定」的结论直接摆出来，
+                            // 否则用户无法判断「仅校园网认证」这个开关到底还在不在生效。
+                            Text("校园网判定：\(model.wifiIsSyny ? "是" : "否")")
+                                .font(.system(size: 11))
+                                .foregroundStyle(model.wifiIsSyny ? .green : .secondary)
                         } else if !model.wifiSSID.isEmpty {
                             Text(model.wifiSSID)
                                 .font(.system(size: 12, weight: .medium))

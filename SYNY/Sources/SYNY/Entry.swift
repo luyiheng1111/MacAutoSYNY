@@ -87,6 +87,19 @@ enum CommandLineTools {
         print("运行方式      : \(modeLabel)")
         print("是否运行中    : \(service.running ? "是" : "否")")
         if let pid = service.pid { print("进程 PID      : \(pid)") }
+        // 后台服务「钉」在哪个可执行文件上 —— 这一行是排查
+        // 「项目一移动后台认证就没了」的第一现场：只要这里不是 /Applications 下的
+        // 路径，项目一动服务就会失效。
+        if ServiceController.agentInstalled() {
+            let program = ServiceController.agentProgramPath()
+            let missing = ServiceController.agentProgramMissing()
+            print("服务指向      : \(program.isEmpty ? "(未记录)" : program)"
+                + (missing ? "  ⚠️ 该文件已不存在，后台认证无法启动" : ""))
+            if !missing && !AppPaths.servicePathIsStable {
+                print("              （「应用程序」里暂无 SYNY.app 副本，"
+                    + "移动或删除该目录会导致服务失效）")
+            }
+        }
         let ssid = PortalClient.currentWifiSSID()
         print("当前 WiFi     : \(ssid.isEmpty ? "(名称不可读，可能缺少定位服务授权)" : ssid)")
         // 校园网判定依据 + 门户口径的会话状态。

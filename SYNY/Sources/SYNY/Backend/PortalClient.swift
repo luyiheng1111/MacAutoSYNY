@@ -3,7 +3,8 @@ import Foundation
 /// 锐捷 eportal 校园网认证（`core.py` 中网络部分的 Swift 移植）。
 ///
 /// 认证流程与原 `ruijie_auto.sh` / Python 版完全一致：
-///   1. 访问连通性探测地址，返回 204 说明已在线；
+///   1. 访问连通性探测地址，据此判断是否已在线
+///      （204 空响应，或 200 且正文里没有任何认证页痕迹）；
 ///   2. 否则从响应正文 / Location 中取出认证页 URL（.../index.jsp?...）；
 ///   3. 把 index.jsp 换成 InterFace.do?method=login 作为登录接口；
 ///   4. 把认证页的 query 做「二次 URL 编码」后作为 queryString 放进 POST 表单；
@@ -30,8 +31,14 @@ enum PortalClient {
         "http://1.1.1.1/",
     ]
 
-    /// 锐捷认证页里常见的参数（用于从页面正文重建认证页 URL）
-    static let portalParamKeys = ["wlanuserip", "wlanacname", "nasip", "wlanacip", "usermac"]
+    /// 锐捷认证页里常见的参数（用于从页面正文重建认证页 URL）。
+    ///
+    /// 注意 MAC 有两个常见写法：网关跳转 URL 里是 `mac`，部分门户页面里是
+    /// `usermac`（全大写形式 `userMac` 也会被正则大小写不敏感地命中）。
+    /// 两个都要收，否则「从页面正文重建」这条路会缺掉客户端身份参数。
+    static let portalParamKeys = [
+        "wlanuserip", "wlanacname", "nasip", "wlanacip", "mac", "usermac",
+    ]
 
     /// 锐捷登录页里常见的标记，用于判断「门户是否仍要求登录」
     static let portalLoginMarkers = [
@@ -50,9 +57,20 @@ enum PortalClient {
     /// 只以「配置的探测地址」为准判定是否在线 —— 部分校园网在未认证时会对
     /// 其它探测域名放行，若把那些返回当作在线依据，就会漏掉认证。
     ///
+    /// 判定顺序（顺序本身就是正确性的一部分，别调换）：
+    ///   1. **先查有没有被门户劫持**：认证页 URL 要么在 `Location` 头（302 劫持），
+    ///      要么嵌在正文的 JS/HTML 里。这一步必须排在最前 —— 否则普通网站的
+    ///      200 正文会被当成「在线」，或反过来把认证页当成正常响应。
+    ///   2. 3xx 且跳到**同站** ⇒ 在线（网站自己的正常跳转，如 baidu 的 http→https）。
+    ///   3. 204 ⇒ 在线（传统 `generate_204` 型探针）。
+    ///   4. 200 ⇒ 正文空则在线；有正文时要求命中 `probeContentMarker`。
+    ///      默认探针是 `http://captive.apple.com/hotspot-detect.html`，
+    ///      返回 **200 + 一句 Success**，靠这一步才能被认成「已在线」。
+    ///
     /// - online = true：已联网，无需认证
     /// - online = false 且 portal 非空：已定位到认证页
-    /// - online = false 且 portal 为空：未能判断（DNS / 连接失败），调用方仍应尝试认证
+    /// - online = false 且 portal 为空：未能判断（DNS / 连接失败 / 疑似被劫持），
+    ///   调用方仍应尝试认证
     static func probe(_ config: AppConfig, timeout: TimeInterval = 6)
         -> (online: Bool, portal: String, detail: String) {
 
@@ -61,27 +79,92 @@ enum PortalClient {
             : config.captiveURL
         let response = HTTP.request(url, timeout: timeout)
 
+        // 1) 被门户劫持的识别优先于一切状态码判断。
+        let portal = extractPortal(body: response.text, location: response.location)
+        if looksLikePortal(portal) {
+            let status = response.status.map(String.init) ?? "?"
+            return (false, portal, "\(url) → HTTP \(status)，检测到认证页")
+        }
+
+        // 2) 3xx 跳转：HTTP 层被刻意设成**不自动跳转**（不跳才能看见劫持的 302），
+        //    所以这里得自己判断这次跳转正不正常。
+        //
+        //    实测踩到的坑：`http://www.baidu.com` 会 302 到 `https://www.baidu.com/`。
+        //    若不处理，这个「正常网站的正常跳转」会掉进最后那条「未识别到认证页」，
+        //    被判成「未联网」—— 于是每轮都白跑一轮认证。
+        //    判据：跳到**同站**算正常；跳到别的站则多半是门户/中间设备插入的跳转。
+        if let status = response.status, (300...399).contains(status),
+           !response.location.isEmpty {
+            if sameSite(url, response.location) {
+                return (true, "", "\(url) → HTTP \(status) 跳转到同站，网络已在线")
+            }
+            return (false, "", "\(url) → HTTP \(status) 跳转到 \(response.location.prefix(80))，疑似被劫持，按未认证处理")
+        }
+
+        // 3) 204 空响应：传统 `generate_204` 探针的「网络正常」。
         if response.status == 204 {
             return (true, "", "\(url) → HTTP 204，网络正常")
         }
+
+        // 4) 200 + 正文：默认探针 `http://captive.apple.com/hotspot-detect.html`
+        //    （以及 baidu 这类）的正常形态。
         if response.status == 200 {
-            let text = response.text
-            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let text = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty {
                 return (true, "", "\(url) → HTTP 200 空响应，网络正常")
             }
-            if text.contains("Microsoft Connect Test") {
-                return (true, "", "\(url) → 连通性正常")
+            if let marker = probeContentMarker(url),
+               !text.lowercased().contains(marker.lowercased()) {
+                // 200 但没有期望内容 ⇒ 多半是门户 / 中间设备塞了一张自有页面。
+                // 宁可判成「未联网」去走一轮认证，也别漏掉认证。
+                return (false, "", "\(url) → HTTP 200，但正文缺少「\(marker)」，疑似被劫持，按未认证处理")
             }
+            return (true, "", "\(url) → HTTP 200 正文正常，网络已在线")
         }
+
         guard let status = response.status else {
             return (false, "", "\(url) → 连接失败（\(String(response.error.prefix(80)))）")
         }
-
-        let portal = extractPortal(body: response.text, location: response.location)
-        if looksLikePortal(portal) {
-            return (false, portal, "\(url) → HTTP \(status)，检测到认证页")
-        }
         return (false, "", "\(url) → HTTP \(status)，未识别到认证页")
+    }
+
+    /// 探针地址对应的「期望正文标记」。命中才允许把 200 判成「已在线」。
+    ///
+    /// 为什么需要它：认证门户常会用一张**自有页面**（200）顶替被劫持的请求，
+    /// 那张页面里未必引用 `index.jsp`，光靠「无认证页痕迹」会误判成在线、
+    /// 从而彻底漏掉认证。要求正文里出现探针站点自己的特征串，可以挡住这类情况。
+    ///
+    /// 返回 nil 表示「不校验正文」—— 用户自定义的探测地址无法预知内容，
+    /// 只能沿用「无认证页痕迹即在线」的宽松规则。
+    static func probeContentMarker(_ url: String) -> String? {
+        let lower = url.lowercased()
+        // 默认探针：Apple 的捕获探测页，正文就一句 Success。
+        // 它与 macOS 自带登录页（CNA）用的是**同一个地址** —— 我们判「在线」的口径
+        // 因此和系统判据完全一致：只要这里看到 Success，系统那次探测也会通过，
+        // 不会再弹出「系统默认登录页」。
+        if lower.contains("apple.com") { return "Success" }
+        if lower.contains("baidu.com") { return "baidu" }
+        if lower.contains("msftconnecttest") { return "Microsoft Connect Test" }
+        return nil
+    }
+
+    /// 两个 URL 是否属于「同一个站点」，用来判断 3xx 跳转是不是正常跳转。
+    ///
+    /// 只做轻量近似：主机名去掉 `www.` 前缀后，允许「一方是另一方的后缀」。
+    /// 例：`www.baidu.com` ↔ `baidu.com` 同站；`www.baidu.com` → `172.16.100.201` 不同站。
+    /// 门户劫持只会把请求带到门户 / 校园网地址，因此这条足以区分
+    /// 「网站自己的正常跳转」与「被中间设备劫持的跳转」。
+    static func sameSite(_ a: String, _ b: String) -> Bool {
+        func host(_ url: String) -> String {
+            var h = WebUtil.split(url).netloc.lowercased()
+            if let at = h.firstIndex(of: "@") { h = String(h[h.index(after: at)...]) }
+            if let colon = h.firstIndex(of: ":") { h = String(h[..<colon]) }
+            return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+        }
+        let ha = host(a)
+        let hb = host(b)
+        guard !ha.isEmpty, !hb.isEmpty else { return false }
+        return ha == hb || ha.hasSuffix("." + hb) || hb.hasSuffix("." + ha)
     }
 
     /// 兼容旧接口。返回 (state, portal, detail)，state ∈ online/offline/error。
@@ -137,9 +220,13 @@ enum PortalClient {
                 "name=[\"']\(escaped)[\"'][^>]*?value=[\"']([^\"']*)[\"']",
                 in: body, options: [.caseInsensitive])
             // 2) wlanuserip = "..." 或 wlanuserip:"..."（JS 赋值）
+            //
+            // 前置 `(?<![A-Za-z0-9_])` 是必须的：没有它，短键 `mac` 会匹配到
+            // `apmac = "..."` / `usermac = "..."` 里 "mac" 那一段，
+            // 从而把 AP 的 MAC 当成客户端 MAC 写进认证地址（登录必失败）。
             if value == nil {
                 value = Regex.firstGroup(
-                    "\(escaped)\\s*[=:]\\s*[\"']([^\"']+)[\"']",
+                    "(?<![A-Za-z0-9_])\(escaped)\\s*[=:]\\s*[\"']([^\"']+)[\"']",
                     in: body, options: [.caseInsensitive])
             }
             if let value, !value.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -210,10 +297,17 @@ enum PortalClient {
                 let found = attempt(url, label: url)
                 if !found.isEmpty { return (found, "来自探针 \(url)") }
             }
-        }
-        for url in ipTriggers {
-            let found = attempt(url, label: url)
-            if !found.isEmpty { return (found, "来自 IP 直连 \(url)") }
+            // IP 直连触发（绕开 DNS）也属于「主动探测」，必须同样受 skipProbes 约束。
+            //
+            // 曾经的 bug：这一层没被包进 `if !skipProbes`，于是调用方明确说
+            // 「别探测了，用缓存」时，仍然会逐个去连这 3 个 IP；而它们在未认证
+            // 网络里通常是被黑洞掉的，每个都要等满 `timeoutIntervalForRequest`，
+            // 一轮白白烧掉 45~60 秒 —— 正好把「抢在系统登录页之前认证」的窗口用完。
+            // 实测：探测在 15:54:59 完成，直到 15:56:00 才发出登录请求。
+            for url in ipTriggers {
+                let found = attempt(url, label: url)
+                if !found.isEmpty { return (found, "来自 IP 直连 \(url)") }
+            }
         }
         let hint = config.portalHint.trimmingCharacters(in: .whitespaces)
         if !hint.isEmpty {
@@ -231,17 +325,29 @@ enum PortalClient {
     /// 这是「用户当前在线、无法复现 captive 页面」场景下的兜底：趁着门户服务器
     /// 可达，先把 wlanacname/nasip 等固定参数存下来，下次断网就能直接复用。
     static func learnPortalWhileOnline(_ config: AppConfig, timeout: TimeInterval = 5) -> String {
-        let cached = cachedPortal()
-        if !cached.isEmpty {
-            cachePortal(cached)
-            return cached
+        var cached = cachedPortal()
+        if cached.isEmpty {
+            let hint = config.portalHint.trimmingCharacters(in: .whitespaces)
+            if !hint.isEmpty {
+                let found = discover(config, timeout: timeout, skipProbes: true)
+                if !found.portal.isEmpty { cached = found.portal }
+            }
         }
-        let hint = config.portalHint.trimmingCharacters(in: .whitespaces)
-        if !hint.isEmpty {
-            let found = discover(config, timeout: timeout, skipProbes: true)
-            if !found.portal.isEmpty { return found.portal }
+        guard !cached.isEmpty else { return "" }
+
+        // 本机读不到网卡 MAC 时（受限执行环境，见 localMac 注释），趁门户可达，
+        // 用门户口径回传的 `userMac` 回填缓存：那是门户**实际绑定**的设备身份，
+        // 比缓存里那个可能已经过期的值可信。这样缓存会自我修复 ——
+        // 下次断网重建认证地址时，用的就是门户认得的那台设备。
+        if localMac().isEmpty {
+            let authoritative = portalBoundMac(config, timeout: timeout)
+            if !authoritative.isEmpty {
+                cached = settingQuery(cached, key: "mac", value: authoritative)
+                Log.write("本机无法读取网卡 MAC，已按门户口径回填 \(authoritative)")
+            }
         }
-        return ""
+        cachePortal(cached)
+        return cached
     }
 
     /// 交叉校验：探测域名若被放行（误判在线），直接问门户是否还需登录。
@@ -315,7 +421,18 @@ enum PortalClient {
         let message = rawMessage.isEmpty ? JSONValue.string(payload["msg"]) : rawMessage
 
         if result == "success" { return (true, message.isEmpty ? "认证成功" : message) }
-        if message.contains("已在线") || message.contains("已经在线") { return (true, message) }
+        // 门户以「目标状态已达成」为语义回复的几种说法，都应算成功而不是失败。
+        // 实测：设备已有会话时锐捷会返回
+        // `{"result":"fail","message":"当前设备已存在在线用户!"}` ——
+        // 注意它里面**没有**「已在线」三个连续字（是「已存在在线用户」），
+        // 用松散的 contains("已在线") 匹配会漏掉，从而把「本来就是通的」报成 ❌，
+        // 用户看到的就是「登录功能坏了」。
+        let alreadyOnlineMarkers = [
+            "已在线", "已经在线", "已存在在线用户", "无需重复登录", "重复登录",
+        ]
+        if alreadyOnlineMarkers.contains(where: { message.contains($0) }) {
+            return (true, message)
+        }
         return (false, message.isEmpty ? "认证失败(HTTP \(status))" : message)
     }
 
@@ -329,54 +446,60 @@ enum PortalClient {
     /// 而不是简单报「成功」或「失败」。
     static func logout(_ config: AppConfig, timeout: TimeInterval = 12) -> (Bool, String) {
         let host = portalNetloc(config)
-        var userIndex = loadSessionUserIndex()
-        // 门户口径结论：本机是不是压根就没有可注销的会话。
-        // 区分「拿不到 userIndex」和「本来就没有会话」很重要 —— 前者像软件故障，
-        // 后者是网络放行机制决定的客观事实，提示文案完全不同。
-        var portalSessionAbsent = false
-        var portalNote = ""
-
-        Log.write("手动下线：门户=\(host.isEmpty ? "(未确定)" : host)"
-            + " userIndex=\(userIndex.isEmpty ? "(无缓存)" : userIndex)")
-
-        if userIndex.isEmpty {
-            // 第一顺位：问门户口径。getOnlineUserInfo 是权威答案，且直接给 userIndex。
-            let (portalIndex, note) = fetchOnlineUserIndex(config, timeout: timeout)
-            portalNote = note
-            if !portalIndex.isEmpty {
-                userIndex = portalIndex
-                Log.write("手动下线：门户口径返回会话 userIndex=\(portalIndex)，直接使用")
-            } else {
-                portalSessionAbsent = true
-                Log.write("手动下线：门户口径确认本机无在线会话（\(note)）")
-                // 第二顺位：部分门户未实现 getOnlineUserInfo，仍按老路子抓一次跳转兜底。
-                userIndex = captureUserIndexIfOnline(config, timeout: timeout)
-                if !userIndex.isEmpty {
-                    portalSessionAbsent = false
-                    Log.write("手动下线：改由门户跳转抓到 userIndex=\(userIndex)")
-                }
-            }
-        }
-
         guard !host.isEmpty else {
             let message = "无法确定认证门户地址，请在「高级设置 → 认证门户」中填写。"
             Log.write("手动下线失败：\(message)", level: "WARN")
             return (false, message)
         }
 
-        if userIndex.isEmpty {
-            if portalSessionAbsent {
-                let message = "门户（\(host)）侧确认本机当前没有在线会话，因此没有可注销的登录。\n\n"
-                    + "你的网络很可能由校园网侧「免认证 / MAC 白名单（无感知认证）」放行，"
-                    + "这种情况门户注销无法断开网络。\n"
-                    + "如需断开，请在系统 Wi-Fi 菜单里断开该网络，或改用有线 / 热点。"
-                Log.write("手动下线：无可注销会话（\(portalNote)）", level: "WARN")
+        Log.write("手动下线：门户=\(host)")
+
+        // 第一顺位（权威）：问门户口径 getOnlineUserInfo。
+        // 注意：本地缓存的 userIndex 不可信 —— 它可能来自上一轮早已失效的会话。
+        // 若拿旧值直接去注销，门户会回「用户已不在线」，从而被误报成「下线失败」。
+        // 因此一律先以门户口径为准，缓存只在门户联系不上时才兜底。
+        let (portalIndex, portalNote) = fetchOnlineUserIndex(config, timeout: timeout)
+        let portalUnreachable = portalNote.hasPrefix("门户不可达")
+        var userIndex = portalIndex
+        if !userIndex.isEmpty {
+            Log.write("手动下线：门户口径返回会话 userIndex=\(portalIndex)，直接使用")
+        }
+
+        // 第二顺位：门户跳转兜底（部分门户未实现 getOnlineUserInfo）。
+        if userIndex.isEmpty && !portalUnreachable {
+            userIndex = captureUserIndexIfOnline(config, timeout: timeout)
+            if !userIndex.isEmpty {
+                Log.write("手动下线：改由门户跳转抓到 userIndex=\(userIndex)")
+            }
+        }
+
+        // 第三顺位：本地缓存（可能是本软件此前登录留下的）。仅在门户联系不上时使用，
+        // 因为此时无从判断缓存是否已失效，只能尽力一试。
+        if userIndex.isEmpty && portalUnreachable {
+            userIndex = loadSessionUserIndex()
+            if !userIndex.isEmpty {
+                Log.write("手动下线：门户不可达，改用本地缓存 userIndex 尝试注销")
+            }
+        }
+
+        guard !userIndex.isEmpty else {
+            if portalUnreachable {
+                let message = "无法联系认证门户（\(host)）确认会话状态：\(portalNote)\n"
+                    + "请确认当前处于校园网环境后重试。"
+                Log.write("手动下线失败：\(message)", level: "WARN")
                 return (false, message)
             }
-            let message = "未检测到登录会话标识（userIndex）。\n"
-                + "请先通过本软件登录，或在浏览器认证页点击「下线」后重试。"
-            Log.write("手动下线失败：\(message)", level: "WARN")
-            return (false, message)
+            // 门户可达、且明确表示没有会话。这**不是故障**：
+            // 校园网侧「免认证 / MAC 白名单（无感知认证）」会让设备无会话直通，
+            // 门户注销无从下手。如实说明，不要报「失败」误导用户。
+            clearSessionUserIndex()
+            let message = "门户（\(host)）侧没有你的在线会话，因此无需下线。\n\n"
+                + "你的网络很可能由校园网侧「免认证 / MAC 白名单（无感知认证）」放行，"
+                + "这种情况门户注销无法断开网络。\n"
+                + "如需断网，请在系统 Wi-Fi 菜单里断开该网络，或改用有线 / 热点。"
+            Log.write("手动下线：门户口径确认本机无在线会话"
+                + "（\(portalNote.isEmpty ? "无会话" : portalNote)），无需注销")
+            return (true, message)
         }
 
         let url = "http://\(host)/eportal/InterFace.do?method=logout"
@@ -397,16 +520,33 @@ enum PortalClient {
 
         // 判定门户是否接受了注销
         var succeeded = false
+        // 门户反馈「该会话本就不存在」（如「用户已不在线」「用户可能已经下线」）。
+        // 目标状态（未登录）已达成，属正常结果，不应报成「下线失败」。
+        var alreadyOffline = false
         var message = ""
         if let payload = tryJSON(response.text) {
             let result = JSONValue.string(payload["result"])
                 .trimmingCharacters(in: .whitespaces).lowercased()
             let rawMessage = JSONValue.string(payload["message"])
             message = rawMessage.isEmpty ? JSONValue.string(payload["msg"]) : rawMessage
-            if ["success", "logout"].contains(result)
+            if message.contains("不在线") || message.contains("已经下线")
+                || message.contains("已下线") {
+                alreadyOffline = true
+            } else if ["success", "logout"].contains(result)
                 || message.contains("成功") || message.contains("下线") {
                 succeeded = true
             }
+        }
+        if alreadyOffline {
+            clearSessionUserIndex()
+            let note = message.isEmpty ? "会话已不存在" : message
+            let finalMessage = "门户（\(host)）侧该会话已不存在（\(note)），无需重复下线。\n\n"
+                + "如需断网，请在系统 Wi-Fi 菜单里断开该网络，或改用有线 / 热点。"
+            Log.write("手动下线：会话已不存在（\(note)），无需重复注销")
+            if config.notify {
+                Notifier.notify(title: AppPaths.appTitle, message: "会话已不存在（无需下线）")
+            }
+            return (true, finalMessage)
         }
         if !succeeded {
             let lower = body.lowercased()
@@ -457,6 +597,28 @@ enum PortalClient {
         let probed = probe(config)
         if probed.online {
             return (true, "网络已在线，无需认证（\(probed.detail)）", false)
+        }
+
+        // 探测失败、又没能识别出认证页时，先确认「认证门户到底通不通」。
+        //
+        // 不通 = 链路还没就绪（Wi-Fi 刚关联、DHCP 还没下来、或改 MAC 后正在重连）。
+        // 此时若照样往下走，多路探测（IP 直连 / 门户线索 / 缓存重建）每一条都要等满
+        // 超时，再叠上登录请求与两次重试，**一轮能吃掉 30~60 秒**；而这段时间恰好就是
+        // 链路恢复的窗口 —— 等本工具转完一圈回来，macOS 的系统登录页（CNA）或网关的
+        // 无感知认证早把网认证掉了。用户看到的就是「后台服务没能完成重新认证」。
+        //
+        // 实测证据（2026-09-24 15:09~15:10）：链路不可用期间连续两轮探针超时，
+        // 一轮用陈旧缓存重建的登录请求挂死后进程被重启，等下一轮探针回来时
+        // 网络已由系统侧认证完毕（门户口径 userUrl 是 captive.apple.com）。
+        //
+        // 改为快速返回（attempted=false）：守护进程安静等链路事件，PathMonitor 一
+        // 唤醒就重新探测，链路一就绪立刻探测到认证页并登录。
+        if probed.portal.isEmpty, !campusPortalReachable(config) {
+            let detail = probed.detail.isEmpty ? "探针未通过" : probed.detail
+            Log.writeThrottled(
+                "链路尚未就绪（\(detail)，且认证门户不可达），本轮不发起认证，等链路恢复后自动重试",
+                tag: "link-not-ready", window: 60)
+            return (false, "链路尚未就绪（认证门户不可达），等待链路恢复", false)
         }
 
         let password = Keychain.password(username: username)
@@ -519,11 +681,44 @@ enum PortalClient {
         var params = (cached["params"] as? [String: Any]) ?? [:]
         guard !netloc.isEmpty, !params.isEmpty else { return "" }
 
-        // wlanuserip 就是本机地址，网络重连后可能变化，用当前值覆盖
+        // 缓存里只有 `wlanacname` / `nasip` / `ssid` / `t` 这类**网络侧参数**是长期
+        // 有效的；`wlanuserip` 与 `mac` 描述的是**这台机器此刻的身份**，必须每次用
+        // 实时值覆盖：
+        //   - 换网络 / 重连 DHCP 会换 IP；
+        //   - macOS「私有 Wi-Fi 地址」默认**轮替**随机 MAC，用户一旦把它关闭
+        //     （或换网络），网卡 MAC 就变了。
+        // 缓存里留着旧身份，门户会按一台并不存在的设备去放行，登录必然失败，
+        // 而日志里看不到任何门户侧报错 —— 表现为「网络明明是通的，本软件就是登不上」。
+        // 实测踩到：用户把「私有 Wi-Fi 地址」关掉、MAC 由随机 `f64e6ff66c4e`
+        // 变成固定 `6c7e67c15c09` 之后，缓存里那条 mac 一直没跟着更新。
         if params["wlanuserip"] != nil {
             let ip = localIP()
             if !ip.isEmpty { params["wlanuserip"] = ip }
         }
+        let mac = localMac()
+        if !mac.isEmpty {
+            var corrected = false
+            for key in ["mac", "usermac"] where params[key] != nil {
+                if JSONValue.string(params[key]).lowercased() != mac { corrected = true }
+                params[key] = mac
+            }
+            if corrected {
+                // 只在真的发生更正时记一条，避免每轮刷日志
+                Log.write("门户缓存中的客户端 MAC 与本机不一致，已按当前网卡 MAC \(mac) 更正")
+            }
+        } else {
+            // 本机读不到网卡 MAC（受限执行环境的典型表现，见 localMac 注释）。
+            // 这里**保留**缓存里的旧值而不是删掉：实测锐捷门户并不校验 mac 参数
+            // （带旧值 / 带真值 / 完全不带，响应完全一致），真正决定绑定的是源 IP；
+            // 去掉反而可能在某些门户实现上被判「参数不完整」。
+            // 但这件事必须在日志里可见，否则又会退化成「网络明明是通的、
+            // 本工具就是登不上」这种无从下手的故障。
+            Log.writeThrottled(
+                "本机读不到网卡 MAC（当前执行环境屏蔽了链路层地址），"
+                + "重建认证地址时沿用缓存中的 \(JSONValue.string(params["mac"]))",
+                tag: "mac-unreadable")
+        }
+
         var path = JSONValue.string(cached["path"])
         if !path.contains("index.jsp") { path = "/eportal/index.jsp" }
 
@@ -773,18 +968,21 @@ enum PortalClient {
     static func evaluateCampusAccess(_ config: AppConfig) -> CampusVerdict {
         let wifi = wifiStatus()
 
-        // 首选：SSID 能读到，就沿用「名称含 syny」的原语义
-        if !wifi.ssid.isEmpty {
-            return wifi.ssid.lowercased().contains("syny")
-                ? .onCampus("WiFi「\(wifi.ssid)」名称含 syny")
-                : .offCampus("WiFi「\(wifi.ssid)」名称不含 syny")
+        // 判据一：SSID 能读到且名称含 syny —— 最快，不必再探门户。
+        if !wifi.ssid.isEmpty, wifi.ssid.lowercased().contains("syny") {
+            return .onCampus("WiFi「\(wifi.ssid)」名称含 syny")
         }
 
-        // 降级：SSID 不可读（缺定位授权 / 走有线）时，看校园门户通不通
+        // 判据二（主判据）：校园门户是否可达。
+        //   - SSID 不可读（macOS 未授予定位权限，本机常态）时，这是唯一可用的判据；
+        //   - SSID 可读但名称不含 syny 时**也不能**就此断定「不在校园网」：
+        //     校内 SSID 未必叫 syny，只看名字会把「在校内网但不叫 syny」误判成
+        //     「不在校园网」从而拒绝认证。所以名字只用来「认定在校」，不再用来「否认」。
         let host = portalHost(config)
         let reachable = campusPortalReachable(config)
-        let situation = wifi.nameIsRedacted ? "Wi-Fi 已连接但名称不可读"
-                                            : "未连接 Wi-Fi"
+        let situation = wifi.ssid.isEmpty
+            ? (wifi.nameIsRedacted ? "WiFi 名称不可读" : "未连接 Wi-Fi")
+            : "WiFi「\(wifi.ssid)」名称不含 syny"
         if reachable {
             return .onCampus("校园门户 \(host ?? "?") 可达（\(situation)）")
         }
@@ -929,6 +1127,122 @@ enum PortalClient {
             if !ip.isEmpty, !ip.hasPrefix("127.") { return ip }
         }
         return ""
+    }
+
+    /// 取当前无线网卡的 MAC，返回 12 位小写十六进制（如 `6c7e67c15c09`），
+    /// 与锐捷认证地址里 `mac` 参数的格式完全一致；读不到时返回空串。
+    ///
+    /// 先定位真正的 Wi-Fi 设备（多网卡机器上 en0 未必是无线网卡），再退回 en0/en1/en2。
+    /// 之所以要「实时读」而不是从配置里存一份：锐捷门户按 **IP + MAC** 绑定会话，
+    /// 用户关掉「私有 Wi-Fi 地址」后 MAC 会变，写死的旧值会让登录一路失败。
+    static func localMac() -> String {
+        // 来源一：getifaddrs 直接读链路层地址 —— 不 fork 子进程，最快也最稳。
+        if let mac = linkLayerMac(interface: wifiHardwareDevice()) { return mac }
+
+        // 来源二：解析 `ifconfig` 输出（兜底）
+        var candidates: [String] = []
+        if let wifi = wifiHardwareDevice() { candidates.append(wifi) }
+        candidates.append(contentsOf: ["en0", "en1", "en2"])
+
+        var seen = Set<String>()
+        for name in candidates where seen.insert(name).inserted {
+            let result = Shell.capture("/sbin/ifconfig", [name],
+                                       env: environmentWithCLocale(), timeout: 3)
+            let text = result.out.isEmpty ? result.err : result.out
+            guard let range = text.range(of: "ether ") else { continue }
+            let raw = text[range.upperBound...]
+                .prefix { $0 != " " && $0 != "\n" && $0 != "\t" }
+            let mac = raw.replacingOccurrences(of: ":", with: "").lowercased()
+            guard isPlausibleMac(mac) else { continue }
+            return mac
+        }
+        return ""
+    }
+
+    /// 是否是「像真实网卡」的 12 位小写十六进制 MAC。
+    ///
+    /// 排除两类占位值：
+    ///   - 全 0（接口未初始化 / 占位）；
+    ///   - 末 5 字节全 0（实测某些受限执行环境会把二进制读到的硬件地址统一替换成
+    ///     `02:00:00:00:00:00`，`ifconfig` 与 `getifaddrs` 两条路都会被替换）。
+    /// 真实网卡末 3 字节是厂商分配的唯一序列号，不可能整段为 0。
+    /// 宁可判定「读不到」，也不要把垃圾写进门户缓存。
+    static func isPlausibleMac(_ mac: String) -> Bool {
+        guard mac.count == 12,
+              mac.allSatisfy({ $0.isHexDigit }),
+              mac != "000000000000",
+              !mac.hasSuffix("0000000000") else { return false }
+        return true
+    }
+
+    /// 用 `getifaddrs` 读链路层地址（MAC），不依赖任何子进程。
+    ///
+    /// 优先级：指定接口 → 任意 `en*`。必须挑接口，是因为 `awdl0` / `bridge0` /
+    /// `anpi*` 这类虚拟接口同样有链路层地址，乱取会把虚拟 MAC 当成网卡 MAC。
+    private static func linkLayerMac(interface: String?) -> String? {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return nil }
+        defer { freeifaddrs(head) }
+
+        var fallback: String?
+        var pointer: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = pointer {
+            defer { pointer = current.pointee.ifa_next }
+            let name = String(cString: current.pointee.ifa_name)
+            guard let address = current.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_LINK) else { continue }
+
+            let link = UnsafeRawPointer(address).assumingMemoryBound(to: sockaddr_dl.self)
+            let nameLength = Int(link.pointee.sdl_nlen)
+            let macLength = Int(link.pointee.sdl_alen)
+            guard macLength == 6 else { continue }
+
+            // sockaddr_dl 的 sdl_data 紧跟在 8 字节定长头之后，MAC 从 sdl_data + sdl_nlen 起
+            let start = UnsafeRawPointer(address).advanced(by: 8 + nameLength)
+            let bytes = Array(UnsafeBufferPointer(
+                start: start.assumingMemoryBound(to: UInt8.self), count: macLength))
+            let mac = bytes.map { String(format: "%02x", $0) }.joined()
+            guard isPlausibleMac(mac) else { continue }
+
+            if let interface, name == interface { return mac }
+            if fallback == nil, name.hasPrefix("en") { fallback = mac }
+        }
+        return fallback
+    }
+
+    /// 门户口径告诉我们「它把哪台设备认成了本机」。
+    ///
+    /// 这是本地读不到 MAC 时的权威兜底：受限执行环境下 `ifconfig` 与 `getifaddrs`
+    /// 都只会给占位值，而门户 `getOnlineUserInfo` 回传的 `userMac` 就是它实际
+    /// 绑定的设备身份。
+    ///
+    /// 必须连 `userIp` 一起校验：只有门户那条会话的 IP 就是本机当前 IP 时，
+    /// 那个 `userMac` 才属于本机（否则会把别人的 MAC 写进缓存）。
+    static func portalBoundMac(_ config: AppConfig, timeout: TimeInterval = 4) -> String {
+        let host = portalNetloc(config)
+        guard !host.isEmpty else { return "" }
+        let response = HTTP.request(
+            "http://\(host)/eportal/InterFace.do?method=getOnlineUserInfo", timeout: timeout)
+        guard response.status != nil, let payload = tryJSON(response.text) else { return "" }
+
+        let mac = JSONValue.string(payload["userMac"])
+            .replacingOccurrences(of: ":", with: "").lowercased()
+        guard isPlausibleMac(mac) else { return "" }
+
+        let boundIP = JSONValue.string(payload["userIp"])
+        let mineIP = localIP()
+        guard !boundIP.isEmpty, !mineIP.isEmpty, boundIP == mineIP else { return "" }
+        return mac
+    }
+
+    /// 把 URL 里的某个查询参数改成指定值（其余原样保留）。
+    private static func settingQuery(_ url: String, key: String, value: String) -> String {
+        let parts = WebUtil.split(url)
+        var pairs = WebUtil.queryDictionary(parts.query)
+        pairs[key] = value
+        let path = parts.path.isEmpty ? "/" : parts.path
+        return "\(parts.scheme)://\(parts.netloc)\(path)?"
+            + WebUtil.formEncode(pairs.map { ($0.key, $0.value) })
     }
 
     // MARK: - 内部工具
